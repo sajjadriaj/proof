@@ -1,0 +1,5 @@
+node_modules/
+# evidence bundles are per-machine artifacts; the contract itself is committed
+.proof/runs/
+.proof/feedback.md
+*.tgz

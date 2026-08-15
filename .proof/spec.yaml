@@ -1,0 +1,181 @@
+# Acceptance contract for proof itself.
+#
+# The requirement is the one the tool exists to serve: a verdict has to mean something.
+# So these check the promises an agent depends on — the exit codes, the refusals, and the
+# machine-readable shape — not just that the suite is green.
+goal: >-
+  proof reports a verdict an agent can act on: 0 when the contract passed, 1 when it failed,
+  2 when the contract itself is wrong, and never DONE for something it did not verify
+
+checks:
+  - name: unit tests
+    run: npm test
+    timeout: 900
+
+  - name: cli is executable
+    file: bin/proof.js
+
+  - name: help lists every command
+    run: node bin/proof.js --help
+    expect_output: "proof report [run]"
+
+  # The three exit codes, each against a contract built for it.
+  - name: a passing contract exits 0
+    run: >-
+      d=$(mktemp -d) && mkdir -p "$d/.proof" &&
+      printf 'goal: g\nchecks:\n  - name: a\n    run: "true"\n' > "$d/.proof/spec.yaml" &&
+      (cd "$d" && node "$OLDPWD/bin/proof.js" check > /dev/null); rc=$?; rm -rf "$d"; exit $rc
+    expect_exit: 0
+
+  - name: a failing contract exits 1
+    run: >-
+      d=$(mktemp -d) && mkdir -p "$d/.proof" &&
+      printf 'goal: g\nchecks:\n  - name: a\n    run: exit 3\n' > "$d/.proof/spec.yaml" &&
+      (cd "$d" && node "$OLDPWD/bin/proof.js" check > /dev/null); rc=$?; rm -rf "$d"; exit $rc
+    expect_exit: 1
+
+  - name: a broken contract exits 2
+    run: >-
+      d=$(mktemp -d) && mkdir -p "$d/.proof" &&
+      printf 'goal: g\nchecks:\n  - name: a\n    frobnicate: 1\n' > "$d/.proof/spec.yaml" &&
+      (cd "$d" && node "$OLDPWD/bin/proof.js" check > /dev/null 2>&1); rc=$?; rm -rf "$d"; exit $rc
+    expect_exit: 2
+
+  # The refusals that stop a verdict meaning less than it looks.
+  - name: an unfinished contract is refused, not passed
+    run: >-
+      d=$(mktemp -d) &&
+      (cd "$d" && node "$OLDPWD/bin/proof.js" init "a requirement" > /dev/null &&
+       node "$OLDPWD/bin/proof.js" check 2>&1); rc=$?; rm -rf "$d"; exit $rc
+    expect_exit: 2
+    expect_output: "placeholder"
+
+  - name: a subset run never claims completion
+    run: >-
+      d=$(mktemp -d) && mkdir -p "$d/.proof" &&
+      printf 'goal: g\nchecks:\n  - name: alpha\n    run: "true"\n  - name: beta\n    run: "true"\n' > "$d/.proof/spec.yaml" &&
+      (cd "$d" && node "$OLDPWD/bin/proof.js" check --only alpha); rc=$?; rm -rf "$d"; exit $rc
+    expect_output: "INCOMPLETE"
+
+  # The shape an agent reads.
+  - name: check --json carries a status and the evidence path
+    run: >-
+      d=$(mktemp -d) && mkdir -p "$d/.proof" &&
+      printf 'goal: g\nchecks:\n  - name: a\n    run: "true"\n' > "$d/.proof/spec.yaml" &&
+      (cd "$d" && node "$OLDPWD/bin/proof.js" check --json |
+       node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const r=JSON.parse(s);
+         if (r.status!=="passed") process.exit(1); if (!r.run) process.exit(1); console.log("ok")})');
+      rc=$?; rm -rf "$d"; exit $rc
+    expect_output: "ok"
+
+  - name: every run writes its evidence
+    run: >-
+      d=$(mktemp -d) && mkdir -p "$d/.proof" &&
+      printf 'goal: g\nchecks:\n  - name: a\n    run: echo hello\n' > "$d/.proof/spec.yaml" &&
+      (cd "$d" && node "$OLDPWD/bin/proof.js" check > /dev/null &&
+       test -f .proof/runs/0001/result.json && test -f .proof/runs/0001/commands.log &&
+       grep -q "asserted:" .proof/runs/0001/commands.log && echo recorded);
+      rc=$?; rm -rf "$d"; exit $rc
+    expect_output: "recorded"
+
+  # Promises added since this contract was written.
+  - name: an unreplaced route pattern is refused
+    run: >-
+      d=$(mktemp -d) && mkdir -p "$d/.proof" &&
+      printf 'goal: g\nserve:\n  run: sleep 30\n  ready_url: http://127.0.0.1:9\n  reuse_existing: true\nchecks:\n  - name: c\n    http: {path: /api/orders/:id}\n' > "$d/.proof/spec.yaml" &&
+      (cd "$d" && node "$OLDPWD/bin/proof.js" check 2>&1); rc=$?; rm -rf "$d"; exit $rc
+    expect_exit: 2
+    expect_output: "still has the route pattern"
+
+  - name: a stale run does not exit 0
+    run: >-
+      d=$(mktemp -d) && cd "$d" && git init -q . && git config user.email t@t.t && git config user.name t &&
+      mkdir -p .proof && echo v1 > app.js &&
+      printf 'goal: g\nchecks:\n  - name: a\n    run: "true"\n' > .proof/spec.yaml &&
+      git add -A && git commit -qm i > /dev/null &&
+      node "$OLDPWD/bin/proof.js" check > /dev/null 2>&1 && echo v2 > app.js &&
+      node "$OLDPWD/bin/proof.js" report > /dev/null 2>&1; rc=$?; cd /; rm -rf "$d"; exit $rc
+    expect_exit: 1
+
+  - name: --spec is honoured by check
+    run: >-
+      d=$(mktemp -d) && mkdir -p "$d/contracts" &&
+      printf 'goal: g\nchecks:\n  - name: a\n    run: "true"\n' > "$d/contracts/release.yaml" &&
+      (cd "$d" && node "$OLDPWD/bin/proof.js" check --spec contracts/release.yaml > /dev/null &&
+       test -f .proof/runs/0001/result.json && echo verified); rc=$?; rm -rf "$d"; exit $rc
+    expect_output: "verified"
+
+  - name: a signalled command is named, not reported as exit null
+    run: >-
+      d=$(mktemp -d) && mkdir -p "$d/.proof" &&
+      printf 'goal: g\nchecks:\n  - name: c\n    run: kill -9 $$\n' > "$d/.proof/spec.yaml" &&
+      (cd "$d" && node "$OLDPWD/bin/proof.js" check 2>&1 | grep -q "killed by SIGKILL" && echo named);
+      rc=$?; rm -rf "$d"; exit $rc
+    expect_output: "named"
+
+  - name: a detaching launcher is not a boot failure
+    run: >-
+      d=$(mktemp -d) && mkdir -p "$d/.proof" && cd "$d" &&
+      printf 'import http from "node:http"\nhttp.createServer((q,s)=>{s.writeHead(200);s.end("ok")}).listen(8291)\n' > s.mjs &&
+      printf '#!/bin/sh\nnohup node s.mjs >/dev/null 2>&1 &\necho $! > server.pid\nexit 0\n' > up.sh && chmod +x up.sh &&
+      printf 'goal: g\nserve:\n  run: ./up.sh\n  ready_url: http://127.0.0.1:8291/\n  timeout: 15\nchecks:\n  - name: api\n    http: {path: /}\n' > .proof/spec.yaml &&
+      node "$OLDPWD/bin/proof.js" check > /dev/null 2>&1; rc=$?;
+      kill "$(cat server.pid 2>/dev/null)" 2>/dev/null; cd /; rm -rf "$d"; exit $rc
+    expect_exit: 0
+
+  # Absence of an answer is not an answer. `changed` printed "nothing to verify" outside a
+  # repository, where it had not looked at anything at all.
+  - name: a blast radius it could not compute is refused, not reported as empty
+    run: >-
+      d=$(mktemp -d) && mkdir -p "$d/.proof" &&
+      printf 'goal: g\nchecks:\n  - name: t\n    run: "true"\n' > "$d/.proof/spec.yaml" &&
+      out=$(cd "$d" && node "$OLDPWD/bin/proof.js" changed 2>&1); rc=$?; rm -rf "$d";
+      test $rc -eq 2 && ! printf '%s' "$out" | grep -q 'nothing to verify'
+    expect_exit: 0
+
+  # The listing is where you are sent when a run cannot be read. It must not be the one
+  # place still willing to vouch for it.
+  - name: a run that cannot be read never shows a verdict
+    run: >-
+      d=$(mktemp -d) && mkdir -p "$d/.proof/runs/0001" &&
+      printf 'goal: g\nchecks:\n  - name: t\n    run: "true"\n' > "$d/.proof/spec.yaml" &&
+      printf '{"status":"passed"}' > "$d/.proof/runs/0001/result.json" &&
+      (cd "$d" && node "$OLDPWD/bin/proof.js" report --list --json); rc=$?; rm -rf "$d"; exit $rc
+    expect_output: '"status": "unreadable"'
+
+  # The goal's last clause, in the form that is easiest to get wrong: an assertion about
+  # what a response does NOT contain proves nothing about what it does.
+  - name: asserting an absence does not silence the content advisory
+    run: >-
+      d=$(mktemp -d) && mkdir -p "$d/.proof" &&
+      printf 'import http from "node:http"\nhttp.createServer((q,s)=>{s.writeHead(200);s.end("hi")}).listen(8412)\n' > "$d/s.mjs" &&
+      printf 'goal: g\nserve:\n  run: node s.mjs\n  ready_url: http://127.0.0.1:8412/\n  timeout: 20\nchecks:\n  - name: page\n    http:\n      path: /\n      expect: {status: 200, body_not_contains: "stack trace"}\n' > "$d/.proof/spec.yaml" &&
+      (cd "$d" && node "$OLDPWD/bin/proof.js" check); rc=$?; rm -rf "$d"; exit $rc
+    expect_output: "asserts what the app actually returned"
+
+  # The thesis, at the layer that gets acted on. A verdict is a claim about a contract and a
+  # suite; when the same diff rewrote either, the verdict alone cannot show it.
+  - name: a verdict says when the verification itself moved
+    run: >-
+      d=$(mktemp -d) && mkdir -p "$d/.proof" "$d/test" &&
+      printf 'goal: g\nchecks:\n  - name: unit tests\n    run: "true"\n' > "$d/.proof/spec.yaml" &&
+      printf 'ok\n' > "$d/test/a.test.js" &&
+      (cd "$d" && git init -q -b main . && git config user.email t@t.t && git config user.name t &&
+       git add -A && git commit -qm base) > /dev/null 2>&1 &&
+      printf 'relaxed\n' >> "$d/test/a.test.js" &&
+      out=$(cd "$d" && node "$OLDPWD/bin/proof.js" check 2>&1); rm -rf "$d";
+      printf '%s' "$out" | grep -q 'existing test file'
+    expect_exit: 0
+
+  # The completion gate itself: an agent that never fixes anything is stopped by the
+  # override with exit 1, and one whose work passes ends the loop with exit 0.
+  - name: guard gates on the contract, not on the agent
+    run: >-
+      d=$(mktemp -d) && mkdir -p "$d/.proof" &&
+      printf 'goal: g\nchecks:\n  - name: marker\n    file: {path: marker.txt}\n' > "$d/.proof/spec.yaml" &&
+      printf '#!/bin/sh\ntrue\n' > "$d/agent.sh" && chmod +x "$d/agent.sh" &&
+      (cd "$d" && node "$OLDPWD/bin/proof.js" guard --max-attempts 2 -- ./agent.sh > /dev/null 2>&1); a=$?;
+      printf '#!/bin/sh\ntouch marker.txt\n' > "$d/agent.sh" &&
+      (cd "$d" && node "$OLDPWD/bin/proof.js" guard --max-attempts 2 -- ./agent.sh > /dev/null 2>&1); b=$?;
+      rm -rf "$d"; test $a -eq 1 && test $b -eq 0
+    expect_exit: 0

@@ -1,0 +1,43 @@
+{
+  "name": "proof-cli",
+  "version": "0.1.0",
+  "description": "Independent verification layer for AI coding agents",
+  "type": "module",
+  "bin": {
+    "proof": "bin/proof.js"
+  },
+  "keywords": [
+    "verification",
+    "acceptance-testing",
+    "ai-agents",
+    "cli",
+    "playwright"
+  ],
+  "files": [
+    "bin",
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node test/run.js"
+  },
+  "peerDependencies": {
+    "playwright": ">=1.40"
+  },
+  "peerDependenciesMeta": {
+    "playwright": {
+      "optional": true
+    }
+  },
+  "dependencies": {
+    "yaml": "^2.5.0"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "playwright": "^1.62.1"
+  }
+}
