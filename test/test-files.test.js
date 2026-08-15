@@ -139,13 +139,14 @@ test('a test file a check does name is reported as covered, not as a test', asyn
 })
 
 test('the regression: an unscannable language says which languages are scanned', () => {
-  // "no code file is in scope" contradicted the .py file listed two lines above. The
-  // limitation is proof's detectors, not the diff.
-  project({ 'app/main.py': '@app.route("/api/health")\ndef health(): pass\n' })
+  // "no code file is in scope" contradicted the file listed two lines above. The
+  // limitation is proof's detectors, not the diff. Ruby, since Python and Go are now
+  // languages the detectors read.
+  project({ 'app/main.rb': 'get "/api/health" do\n  "ok"\nend\n' })
 
   const out = captured(() => infer({})).replace(/\s+/g, ' ')
   assert.match(out, /No file in scope is one proof can scan for gaps/)
-  assert.match(out, /JavaScript and TypeScript/)
+  assert.match(out, /JavaScript, TypeScript, Python and Go/)
   assert.match(out, /`run:` checks work in any language/, 'and what still works')
   assert.doesNotMatch(out, /no code file is in scope/)
 })

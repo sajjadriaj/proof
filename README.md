@@ -1054,14 +1054,17 @@ Nothing was scanned — no code file is in scope, so gaps cannot be derived from
 ```
 
 Detection is deterministic, not a model call: framework file routes (Next app router,
-`pages/api`), Express/Fastify/Hono handlers, `process.env` reads checked against your
+`pages/api`), Express/Fastify/Hono handlers, Flask/FastAPI decorators, Go `net/http` and
+chi/gin/echo registrations (Go 1.22 `"POST /path"` patterns included), env reads
+(`process.env`, `os.environ`, `os.getenv`, `os.Getenv`, `os.LookupEnv`) checked against your
 `.env.example`, migration directories mapped to the migrator in your `package.json`.
-`proof` does not guess at semantics it cannot observe.
+`proof` does not guess at semantics it cannot observe. The import graph for the blast radius
+stays JavaScript/TypeScript-only, and `changed` says so rather than reporting an empty one.
 
 Precision matters more than recall here, because a wrong suggestion costs an agent a whole
 iteration. So: only string literals beginning with `/` count as routes, which keeps
 Express's `app.get('port')` settings getter and client calls like `api.get('users')` out of
-the list. Paths carrying `:id`, `[id]` or an unresolved `${id}` are reported as gaps but
+the list. Paths carrying `:id`, `[id]`, `{id}`, Flask's `<id>` or an unresolved `${id}` are reported as gaps but
 flagged dynamic, since the URL cannot be requested as written. Platform-injected variables
 (`NODE_ENV`, `PORT`, `CI`, `npm_*`, `VERCEL_*`, …) are skipped so they do not bury the one
 deployment secret that actually goes missing.

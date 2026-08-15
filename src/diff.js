@@ -9,7 +9,7 @@ import { changedFiles, addedFiles } from './git.js'
  * product. A gap list that long is one nobody reads, which costs more than the two real
  * entries buried in it are worth.
  */
-const TEST_FILE = /(?:^|\/)(?:__tests__|__mocks__|__fixtures__|tests?|e2e|cypress|fixtures)\/|\.(?:test|spec|stories|fixture)\.[jt]sx?$/
+const TEST_FILE = /(?:^|\/)(?:__tests__|__mocks__|__fixtures__|tests?|e2e|cypress|fixtures)\/|\.(?:test|spec|stories|fixture)\.[jt]sx?$|(?:^|\/)(?:test_[^/]+|conftest)\.py$|_test\.(?:py|go)$/
 
 export const isTestFile = f => TEST_FILE.test(f)
 

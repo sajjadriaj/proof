@@ -28,7 +28,7 @@ const read = f => {
     return ''
   }
 }
-const CODE = /\.[jt]sx?$|\.[cm][jt]s$/
+const CODE = /\.[jt]sx?$|\.[cm][jt]s$|\.py$|\.go$/
 
 
 
@@ -56,7 +56,91 @@ const MOUNTABLE = new Set(['router'])
 
 const lineOf = (src, index) => src.slice(0, index).split('\n').length
 
+// --- python & go -------------------------------------------------------------
+// Same contract as the JS detectors: regex over comment-stripped source, every hit
+// locatable as file:line. Import graphs stay JS-only — `changed` says so — but a route or
+// an env read is the same shape in any language, and "proof cannot look here" was the
+// answer for the two ecosystems `init` already scaffolds serve commands for.
+
+/** `#` comments blanked, string-aware, byte positions preserved — lineOf depends on it. */
+export function stripPy(src) {
+  let out = ''
+  let i = 0
+  while (i < src.length) {
+    const ch = src[i]
+    const three = src.slice(i, i + 3)
+    if (three === "'''" || three === '"""') {
+      // Triple-quoted content is blanked, newlines kept: docstrings are documentation, and
+      // a route written in one (`@app.route("/x")` in a usage example) is not a registration.
+      // Single-quoted strings stay — route paths live in those.
+      const end = src.indexOf(three, i + 3)
+      const stop = end === -1 ? src.length : end + 3
+      out += three + src.slice(i + 3, stop).replace(/[^\n]/g, ' '); i = stop; continue
+    }
+    if (ch === "'" || ch === '"') {
+      let j = i + 1
+      while (j < src.length && src[j] !== ch && src[j] !== '\n') { if (src[j] === '\\') j++; j++ }
+      out += src.slice(i, Math.min(j + 1, src.length)); i = j + 1; continue
+    }
+    if (ch === '#') {
+      let j = i
+      while (j < src.length && src[j] !== '\n') j++
+      out += ' '.repeat(j - i); i = j; continue
+    }
+    out += ch; i++
+  }
+  return out
+}
+
+// `@app.route("/x", methods=["POST"])`, and the FastAPI/Flask 2 shorthand `@router.get("/x")`.
+const PY_ROUTE = /@\s*([A-Za-z_]\w*)\s*\.\s*(route|get|post|put|patch|delete)\s*\(\s*['"]([^'"]+)['"]([^)]*)/g
+
+function pyRoutes(file) {
+  const src = stripPy(read(file))
+  const out = []
+  for (const m of src.matchAll(PY_ROUTE)) {
+    if (!m[3].startsWith('/')) continue
+    const at = `${file}:${lineOf(src, m.index)}`
+    if (m[2] === 'route') {
+      // methods=["POST", "GET"] on the same call; Flask defaults to GET without it
+      const listed = [...(m[4] ?? '').matchAll(/['"](GET|POST|PUT|PATCH|DELETE)['"]/gi)].map(x => x[1].toUpperCase())
+      for (const method of listed.length ? [...new Set(listed)] : ['GET']) out.push({ method, path: m[3], at })
+    } else {
+      out.push({ method: m[2].toUpperCase(), path: m[3], at })
+    }
+  }
+  return out
+}
+
+// `http.HandleFunc("/x", h)` and the chi/gin/echo method receivers. Go 1.22 patterns put
+// the method inside the string: HandleFunc("POST /orders", h).
+const GO_ROUTE = /\.\s*(HandleFunc|Handle|Get|Post|Put|Patch|Delete|GET|POST|PUT|PATCH|DELETE)\s*\(\s*"([^"]+)"/g
+
+function goRoutes(file) {
+  const src = stripComments(read(file))   // Go comments are the C family stripComments knows
+  const out = []
+  for (const m of src.matchAll(GO_ROUTE)) {
+    const at = `${file}:${lineOf(src, m.index)}`
+    let method = m[1].toUpperCase()
+    let path = m[2]
+    if (method === 'HANDLEFUNC' || method === 'HANDLE') {
+      const pattern = path.match(/^(GET|POST|PUT|PATCH|DELETE)\s+(\S+)$/)
+      if (pattern) { method = pattern[1]; path = pattern[2] }
+      else method = 'GET'                  // net/http registers every method; GET stands for the route
+    }
+    if (!path.startsWith('/')) continue
+    out.push({ method, path, at })
+  }
+  return out
+}
+
+const PY_ENV = /os\.(?:environ\s*(?:\[\s*['"]([A-Z][A-Z0-9_]{2,})['"]\s*\]|\.get\(\s*['"]([A-Z][A-Z0-9_]{2,})['"])|getenv\(\s*['"]([A-Z][A-Z0-9_]{2,})['"])/g
+const GO_ENV = /os\.(?:Getenv|LookupEnv)\(\s*"([A-Z][A-Z0-9_]{2,})"/g
+
+
 export function routesIn(file) {
+  if (file.endsWith('.py')) return pyRoutes(file)
+  if (file.endsWith('.go')) return goRoutes(file)
   const out = []
   const src = stripComments(read(file))
   const path = fileRoute(file)
@@ -103,11 +187,19 @@ export function routesIn(file) {
 }
 
 // `[id]`, `:id` and an unresolved `${id}` all mean the URL cannot be requested as written.
-export const isDynamicPath = p => /[:[{]/.test(p)
+export const isDynamicPath = p => /[:[{<]/.test(p)
 
 const ENV_REF = /(?:process\.env|import\.meta\.env)(?:\.([A-Z][A-Z0-9_]{2,})|\[\s*['"]([A-Z][A-Z0-9_]{2,})['"]\s*\])/g
 
 export function envRefsIn(file) {
+  if (file.endsWith('.py')) {
+    const src = stripPy(read(file))
+    return [...src.matchAll(PY_ENV)].map(m => ({ name: m[1] ?? m[2] ?? m[3], at: `${file}:${lineOf(src, m.index)}` }))
+  }
+  if (file.endsWith('.go')) {
+    const src = stripComments(read(file))
+    return [...src.matchAll(GO_ENV)].map(m => ({ name: m[1], at: `${file}:${lineOf(src, m.index)}` }))
+  }
   const src = stripComments(read(file))
   return [...src.matchAll(ENV_REF)].map(m => ({ name: m[1] ?? m[2], at: `${file}:${lineOf(src, m.index)}` }))
 }
@@ -405,7 +497,7 @@ function printHuman(o, gaps, write) {
           + ' application gaps from those.\n'
         : o.files > 0
           ? '\nNo file in scope is one proof can scan for gaps — its route and environment detectors'
-            + ' read JavaScript and TypeScript. `run:` checks work in any language.\n'
+            + ' read JavaScript, TypeScript, Python and Go. `run:` checks work in any language.\n'
           : '\nNothing is in scope, so there are no gaps to derive from this change.\n'
     console.log(`\n${block(nothingScanned.trim(), '')}\n`)
     return

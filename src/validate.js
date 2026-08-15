@@ -128,14 +128,16 @@ const needsBase = (where, problems) => problems.push(
  *
  * Only whole segments count: `?t=12:30` and `host:3000` are ordinary URLs.
  */
-const DYNAMIC_SEGMENT = /(?:^|\/)[:[{][^/]*/
+const DYNAMIC_SEGMENT = /(?:^|\/)[:[{<][^/]*/
 
 function mustBeRequestable(value, where, problems) {
   if (typeof value !== 'string') return
 
-  // `<port>` and friends are what proof scaffolds when it will not guess. Uncommented but
-  // not filled in, they reach the runner and fail there instead of here.
-  const placeholder = value.match(/<[^>]+>/)
+  // `<port>` and `<your dev command>` are what proof scaffolds when it will not guess.
+  // Matched by name, not by shape: Flask's `<id>` / `<int:id>` are route patterns, and
+  // telling their author "proof scaffolds these" blames proof for a value it never wrote —
+  // the route-pattern message below owns everything else in angle brackets.
+  const placeholder = value.match(/<(?:port|[^>]*\s[^>]*)>/)
   if (placeholder) {
     problems.push(
       `${where}: "${value}" still has the placeholder ${placeholder[0]} in it`
