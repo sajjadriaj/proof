@@ -107,7 +107,8 @@ test('a usage error is distinguishable from a problem with the project', () => {
 test('every documented code is one proof can actually produce', async () => {
   // A table of codes nothing emits is worse than no table.
   const { readFileSync, readdirSync } = await import('node:fs')
-  const readme = readFileSync(new URL('../README.md', import.meta.url), 'utf8')
+  const readme = ['../README.md', ...readdirSync(new URL('../docs', import.meta.url)).filter(f => f.endsWith('.md')).map(f => `../docs/${f}`)]
+    .map(f => readFileSync(new URL(f, import.meta.url), 'utf8')).join('\n\n')
   const documented = [...readme.matchAll(/^\| `(E[A-Z]+)`(?: \/ `(E[A-Z]+)`)? \|/gm)].flatMap(m => [m[1], m[2]]).filter(Boolean)
 
   // Every source, not a hand-maintained list — moving an error between modules is a refactor,

@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
+import { readFileSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
 import YAML from 'yaml'
 import { validateSpec, VERBS } from '../src/validate.js'
@@ -14,7 +14,11 @@ import { CONTRACT_CHANGED_NOTICE } from '../src/spec.js'
 import { ALLOWED } from '../src/validate.js'
 
 const root = join(import.meta.dirname, '..')
-const README = readFileSync(join(root, 'README.md'), 'utf8')
+// The corpus is the README plus everything under docs/ — the reference moved there, and
+// a drift guard that stops at the front page would miss exactly the pages that drift.
+const README = [join(root, 'README.md'),
+  ...readdirSync(join(root, 'docs')).filter(f => f.endsWith('.md')).map(f => join(root, 'docs', f))]
+  .map(f => readFileSync(f, 'utf8')).join('\n\n')
 const USAGE = readFileSync(join(root, 'bin/proof.js'), 'utf8')
 
 const yamlBlocks = () => [...README.matchAll(/```yaml\n([\s\S]*?)```/g)].map(m => m[1])
