@@ -1,7 +1,7 @@
 import { readFileSync, existsSync } from 'node:fs'
 import YAML from 'yaml'
 import { changedFiles, noCommonHistory, SHALLOW } from './git.js'
-import { walk, dependents, coverage, scanWarnings, resetScan, dependencyChanges, stripComments, fileRoute, PKG } from './changed.js'
+import { walk, dependents, coverage, scanWarnings, resetScan, dependencyChanges, stripComments, stripPy, fileRoute, PKG } from './changed.js'
 import { isTestFile } from './diff.js'
 import { loadSpec, SPEC_PATH, PROOF_DIR, withSpecLock, writeFileAtomic } from './spec.js'
 import { padTo, truncateToWidth, columnWidth, block } from './terminal.js'
@@ -11,7 +11,7 @@ import { PLACEHOLDER_RUN, placeholderChecks } from './validate.js'
 // row to the longest one wraps the whole list.
 const TITLE_COLUMN_MAX = 64
 
-export { stripComments, fileRoute } from './changed.js'
+export { stripComments, stripPy, fileRoute } from './changed.js'
 export { isTestFile } from './diff.js'
 
 // A file proof could not read yields no routes and no env references — which is
@@ -58,39 +58,11 @@ const lineOf = (src, index) => src.slice(0, index).split('\n').length
 
 // --- python & go -------------------------------------------------------------
 // Same contract as the JS detectors: regex over comment-stripped source, every hit
-// locatable as file:line. Import graphs stay JS-only — `changed` says so — but a route or
+// locatable as file:line. Go has no import graph yet — `changed` says so — but a route or
 // an env read is the same shape in any language, and "proof cannot look here" was the
 // answer for the two ecosystems `init` already scaffolds serve commands for.
-
-/** `#` comments blanked, string-aware, byte positions preserved — lineOf depends on it. */
-export function stripPy(src) {
-  let out = ''
-  let i = 0
-  while (i < src.length) {
-    const ch = src[i]
-    const three = src.slice(i, i + 3)
-    if (three === "'''" || three === '"""') {
-      // Triple-quoted content is blanked, newlines kept: docstrings are documentation, and
-      // a route written in one (`@app.route("/x")` in a usage example) is not a registration.
-      // Single-quoted strings stay — route paths live in those.
-      const end = src.indexOf(three, i + 3)
-      const stop = end === -1 ? src.length : end + 3
-      out += three + src.slice(i + 3, stop).replace(/[^\n]/g, ' '); i = stop; continue
-    }
-    if (ch === "'" || ch === '"') {
-      let j = i + 1
-      while (j < src.length && src[j] !== ch && src[j] !== '\n') { if (src[j] === '\\') j++; j++ }
-      out += src.slice(i, Math.min(j + 1, src.length)); i = j + 1; continue
-    }
-    if (ch === '#') {
-      let j = i
-      while (j < src.length && src[j] !== '\n') j++
-      out += ' '.repeat(j - i); i = j; continue
-    }
-    out += ch; i++
-  }
-  return out
-}
+//
+// `stripPy` lives beside the Python import scan in changed.js, next to the JS one it mirrors.
 
 // `@app.route("/x", methods=["POST"])`, and the FastAPI/Flask 2 shorthand `@router.get("/x")`.
 const PY_ROUTE = /@\s*([A-Za-z_]\w*)\s*\.\s*(route|get|post|put|patch|delete)\s*\(\s*['"]([^'"]+)['"]([^)]*)/g

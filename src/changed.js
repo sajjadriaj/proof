@@ -6,7 +6,9 @@ import { loadSpec, PROOF_DIR, SPEC_PATH, contractChange, CONTRACT_CHANGED_NOTICE
 import { isTestFile, testsChanged, fillTestsNotice } from './diff.js'
 import { TERMINAL_WIDTH, ellipsize, block, padTo, columnWidth } from './terminal.js'
 
-const SRC_EXT = ['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.mts', '.cts', '.vue', '.svelte']
+const JS_EXT = ['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.mts', '.cts', '.vue', '.svelte']
+const PY_EXT = ['.py']
+const SRC_EXT = [...JS_EXT, ...PY_EXT]
 const IGNORE = new Set(['node_modules', 'dist', 'build', 'coverage', 'vendor', 'target', '__pycache__', 'out'])
 
 // Paths the scan could not read. An unreadable file used to vanish silently and an
@@ -294,8 +296,8 @@ const withSourceBases = base => {
 /** Every path this specifier could name, whether or not anything is there now. */
 const candidatesFor = base => [
   ...withSourceBases(base),
-  ...SRC_EXT.map(e => base + e),
-  ...SRC_EXT.map(e => join(base, 'index' + e)),
+  ...JS_EXT.map(e => base + e),
+  ...JS_EXT.map(e => join(base, 'index' + e)),
 ]
 
 export function specifierCandidates(spec, fromFile) {
@@ -311,6 +313,125 @@ export function resolveSpecifier(spec, fromFile) {
   }
   return null
 }
+
+// --- python ------------------------------------------------------------------------------
+// Same two halves as the JS side: pull specifiers out of comment-stripped source, then turn
+// each one into repo paths. Without this a Python repo got "not derivable — no changed file
+// could be scanned for imports" for its entire diff: not a blast radius, an apology.
+
+/** `#` comments blanked, string-aware, byte positions preserved — `infer`'s lineOf needs that. */
+export function stripPy(src) {
+  let out = ''
+  let i = 0
+  while (i < src.length) {
+    const ch = src[i]
+    const three = src.slice(i, i + 3)
+    if (three === "'''" || three === '"""') {
+      // Triple-quoted content is blanked, newlines kept: docstrings are documentation, and
+      // a route written in one (`@app.route("/x")` in a usage example) is not a registration.
+      // Single-quoted strings stay — route paths live in those.
+      const end = src.indexOf(three, i + 3)
+      const stop = end === -1 ? src.length : end + 3
+      out += three + src.slice(i + 3, stop).replace(/[^\n]/g, ' '); i = stop; continue
+    }
+    if (ch === "'" || ch === '"') {
+      let j = i + 1
+      while (j < src.length && src[j] !== ch && src[j] !== '\n') { if (src[j] === '\\') j++; j++ }
+      out += src.slice(i, Math.min(j + 1, src.length)); i = j + 1; continue
+    }
+    if (ch === '#') {
+      let j = i
+      while (j < src.length && src[j] !== '\n') j++
+      out += ' '.repeat(j - i); i = j; continue
+    }
+    out += ch; i++
+  }
+  return out
+}
+
+// A parenthesised list spans lines, and `from wanda.projection.repo import (\n  a,\n  b,\n)`
+// is the ordinary way to import more than two names. Matching only the first line found the
+// parent module and lost every name after it, so a changed submodule kept no importers.
+// Line positions do not survive this; nothing here reports them.
+const flattenImportLists = src =>
+  src.replace(/\bimport[ \t]*\(([^)]*)\)/g, (_, body) => `import ${body.replace(/\s+/g, ' ')}`)
+
+const PY_FROM = /^[ \t]*from[ \t]+([.\w]+)[ \t]+import[ \t]+([^\n]*)/gm
+const PY_PLAIN = /^[ \t]*import[ \t]+([\w.]+(?:[ \t]*,[ \t]*[\w.]+)*)/gm
+
+const bareName = part => part.trim().split(/\s+as\s+/)[0].trim()
+
+/**
+ * Dotted modules one file imports.
+ *
+ * `from a.b import c` yields `a.b` AND `a.b.c`. Whether `c` is a submodule or a name defined
+ * inside `a.b` cannot be known without importing it, so both are offered and the resolver
+ * takes whichever exists — the submodule when there is one, the parent otherwise.
+ */
+export function pyImportsOf(src) {
+  const flat = flattenImportLists(stripPy(src))
+  const out = []
+  for (const m of flat.matchAll(PY_FROM)) {
+    const module = m[1]
+    out.push(module)
+    for (const part of m[2].split(',')) {
+      const name = bareName(part)
+      if (/^\w+$/.test(name)) out.push(module.endsWith('.') ? module + name : `${module}.${name}`)
+    }
+  }
+  for (const m of flat.matchAll(PY_PLAIN)) {
+    for (const part of m[1].split(',')) {
+      const name = bareName(part)
+      if (name) out.push(name)
+    }
+  }
+  return out
+}
+
+// Where a top-level package can sit. The src-layout convention is the only one worth
+// guessing: a path configured in pyproject or PYTHONPATH is not read, and a module it would
+// have found falls through to the package edge, exactly like an installed dependency.
+const PY_ROOTS = ['.', 'src']
+
+const pyBases = (spec, fromFile) => {
+  const dots = /^\.*/.exec(spec)[0].length
+  const parts = spec.slice(dots).split('.').filter(Boolean)
+  if (!dots) return PY_ROOTS.map(root => resolve(root, ...parts))
+
+  // One dot is this file's own package, each extra dot one level up.
+  let dir = dirname(fromFile)
+  for (let i = 1; i < dots; i++) dir = dirname(dir)
+  return [resolve(dir, ...parts)]
+}
+
+const pyCandidatesFor = base => [base + '.py', join(base, '__init__.py')]
+
+export const pyCandidates = (spec, fromFile) =>
+  pyBases(spec, fromFile).flatMap(base => pyCandidatesFor(base).map(p => relative('.', p)))
+
+export function resolvePyModule(spec, fromFile) {
+  for (const base of pyBases(spec, fromFile)) {
+    for (const cand of pyCandidatesFor(base)) if (isFile(cand)) return relative('.', cand)
+  }
+  return null
+}
+
+/**
+ * Whether a module could live in this repo at all.
+ *
+ * The JS side records the paths an unresolved specifier would have named, so deleting a
+ * module still finds its importers. Doing that for every `import temporalio` too would key
+ * edges at `temporalio/client.py` — paths this repo will never have — and, worse, consume
+ * the specifier so it never became a package edge.
+ */
+export const pyLooksLocal = spec => {
+  if (spec.startsWith('.')) return true
+  const head = spec.split('.')[0]
+  return PY_ROOTS.some(root => existsSync(join(root, head)) || existsSync(join(root, `${head}.py`)))
+}
+
+/** The distribution a non-relative module belongs to (`temporalio.client` -> `temporalio`). */
+export const pyPackageOf = spec => (spec.startsWith('.') ? null : spec.split('.')[0] || null)
 
 export const PKG = 'pkg:'
 
@@ -365,6 +486,25 @@ function manifestChanges(manifest, base) {
     .map(name => ({ name, from: a[name] ?? null, to: b[name] ?? null, manifest }))
 }
 
+// One language, four questions: what does this file import, where does a specifier point,
+// what paths could it have pointed at, and what package does it belong to. `local` is the
+// only asymmetry — see `pyLooksLocal`.
+const JS = {
+  imports: src => importsOf(stripComments(src)),
+  resolve: resolveSpecifier,
+  candidates: specifierCandidates,
+  packageOf,
+}
+const PY = {
+  imports: pyImportsOf,
+  resolve: resolvePyModule,
+  candidates: pyCandidates,
+  packageOf: pyPackageOf,
+  local: pyLooksLocal,
+}
+
+const languageOf = file => (PY_EXT.includes(extname(file)) ? PY : JS)
+
 /** file -> Set of files importing it */
 export function reverseGraph(files = walk()) {
   const rev = new Map()
@@ -377,14 +517,15 @@ export function reverseGraph(files = walk()) {
       rev.get(target).add(importer)
     }
 
-    for (const spec of importsOf(stripComments(src))) {
-      const target = resolveSpecifier(spec, f)
+    const lang = languageOf(f)
+    for (const spec of lang.imports(src)) {
+      const target = lang.resolve(spec, f)
       if (target) { addEdge(target, f); continue }
 
       // Nothing is there now. That is exactly what a just-deleted module looks like, and
       // deleting one breaks every importer — the blast radius that matters most. Record the
       // paths the specifier would have named so a lookup by the deleted path still finds them.
-      const candidates = specifierCandidates(spec, f)
+      const candidates = lang.local?.(spec) === false ? [] : lang.candidates(spec, f)
       if (candidates.length) {
         for (const candidate of candidates) addEdge(candidate, f)
         continue
@@ -392,7 +533,7 @@ export function reverseGraph(files = walk()) {
 
       // A bare specifier is a package. Keyed separately so a dependency bump can find
       // everything that imports it.
-      const pkg = packageOf(spec)
+      const pkg = lang.packageOf(spec)
       if (pkg) addEdge(`${PKG}${pkg}`, f)
     }
   }
@@ -434,7 +575,10 @@ export function fileRoute(f) {
 // they fail in both directions: `index.ts` was excluded and so matched nothing, while
 // `page.tsx` matched any check mentioning "page" — every page file in the repo at once.
 // What identifies such a file is the directory it sits in.
-const GENERIC = new Set(['index', 'route', 'page', 'layout', 'main', 'mod', 'handler'])
+// `__init__.py` names its package, never itself, so it belongs here for the same reason
+// `index.ts` does.
+const GENERIC = new Set(['index', 'route', 'page', 'layout', 'main', 'mod', 'handler',
+  '__init__', '__main__'])
 
 const usable = name => name.length >= 4 && !GENERIC.has(name.toLowerCase()) && !/^[[({]/.test(name)
 
