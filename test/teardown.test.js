@@ -59,8 +59,10 @@ test('serve that never becomes ready is torn down too', async () => {
   const port = await freePort()
   spec({
     goal: 'teardown',
-    // listens on `port` but we poll a port nothing answers on, so readiness times out
-    serve: { run: LISTENER(port), ready_url: `http://127.0.0.1:${port + 1000}`, timeout: 2 },
+    // listens on `port` but we poll a port nothing answers on, so readiness times out.
+    // Below, not above: an ephemeral port is near the top of the range, so `port + 1000`
+    // produced 65841 often enough to fail the run, and the contract rightly refused it.
+    serve: { run: LISTENER(port), ready_url: `http://127.0.0.1:${port - 1000}`, timeout: 2 },
     checks: [{ name: 'never runs', run: 'true' }],
   })
 

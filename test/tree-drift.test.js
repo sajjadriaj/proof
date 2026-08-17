@@ -36,7 +36,9 @@ test('the regression: an edit during the run is reported, not silently absorbed'
     goal: 'the app reports version 1.0.0',
     checks: [
       { name: 'version is 1.0.0', file: { path: 'app.js', contains: '1.0.0' } },
-      { name: 'something edits the tree', run: "sed -i 's/1.0.0/9.9.9/' app.js" },
+      // Not `sed -i`: BSD sed wants an argument to -i and GNU sed refuses one, so the
+      // portable spelling of "edit a tracked file" is to rewrite it.
+      { name: 'something edits the tree', run: 'printf \'export const version = "9.9.9"\\n\' > app.js' },
     ],
   })
 

@@ -51,6 +51,17 @@ NOTE
 
 `extends` is not followed.
 
+**Python** modules resolve the same way, from the repo root and from `src/` for the src-layout
+convention. `from a.b import c` is read as both `a.b` and `a.b.c`, because whether `c` is a
+submodule or a name defined inside `a.b` is not knowable without importing it — whichever file
+exists is the one the edge points at, submodule first. A parenthesised import list counts every
+name in it, relative imports (`from .`, `from ..pkg`) resolve against the importing file's
+package, and a module that is not in the repo becomes a package edge rather than a fabricated
+local path. A path configured only in `pyproject.toml` or `PYTHONPATH` is not read, so a module
+it would have found is treated as an installed one. Dependency bumps are read from
+`package.json` only: a version change in `pyproject.toml` shows the file as changed with no
+dependents derived from it.
+
 Files `proof` cannot scan for imports — lockfiles, `tsconfig.json`, configs, assets — are
 named rather than passed over. Both can change the whole build, and an empty radius would
 otherwise read as "nothing is affected" when it means "this cannot be derived":
@@ -173,7 +184,8 @@ chi/gin/echo registrations (Go 1.22 `"POST /path"` patterns included), env reads
 (`process.env`, `os.environ`, `os.getenv`, `os.Getenv`, `os.LookupEnv`) checked against your
 `.env.example`, migration directories mapped to the migrator in your `package.json`.
 `proof` does not guess at semantics it cannot observe. The import graph for the blast radius
-stays JavaScript/TypeScript-only, and `changed` says so rather than reporting an empty one.
+reads JavaScript/TypeScript and Python; for anything else `changed` says the file was not
+import-scannable rather than reporting an empty radius as an answer.
 
 Precision matters more than recall here, because a wrong suggestion costs an agent a whole
 iteration. So: only string literals beginning with `/` count as routes, which keeps

@@ -166,5 +166,40 @@ test('an app that dies mid-run is reported by the liveness check with the decode
 
   assert.equal(liveness.status, 'failed')
   assert.match(liveness.observed, /SIGSEGV/, liveness.observed)
-  assert.match(liveness.output ?? '', /Segmentation fault/, 'the app said so too')
+
+  // The shell's own crash message is not asserted: Linux bash prints "Segmentation fault
+  // (core dumped)", macOS /bin/sh (bash 3.2) prints nothing at all for a signalled child of
+  // `sh -c`. Which is the reason the decoded exit code exists — it is proof's answer, and it
+  // does not vary by platform.
+})
+
+test('a launcher that is itself signalled says so, having no exit code to decode', async () => {
+  // The case above goes through the shell, which turns the signal into exit 139. `exec`
+  // replaces the shell, so the app IS the process proof spawned — and a signalled process has
+  // no exit code at all. Reading only `exitCode` reported the crash with the most to say as
+  // the one with nothing to say: "no longer responding", cause omitted.
+  const dir = mkdtempSync(join(tmpdir(), 'proof-signals-exec-'))
+  process.chdir(dir)
+  mkdirSync('.proof')
+  writeFileSync('server.py',
+    'import os, signal, sys\n'
+    + 'from http.server import BaseHTTPRequestHandler, HTTPServer\n'
+    + 'class H(BaseHTTPRequestHandler):\n'
+    + '    def do_GET(self):\n'
+    + "        self.send_response(200); self.end_headers(); self.wfile.write(b'ok')\n"
+    + "        if self.path == '/boom':\n"
+    + '            sys.stdout.flush(); os.kill(os.getpid(), signal.SIGSEGV)\n'
+    + '    def log_message(self, *a): pass\n'
+    + "HTTPServer(('127.0.0.1', 8273), H).serve_forever()\n")
+  writeFileSync('.proof/spec.yaml',
+    'goal: g\nserve:\n  run: exec python3 server.py\n  ready_url: http://127.0.0.1:8273/\n  timeout: 15\n'
+    + 'checks:\n  - name: healthy\n    http: {path: /}\n  - name: crashes\n    http: {path: /boom}\n')
+
+  await quiet(() => check({ json: true }))
+  const r = JSON.parse(readFileSync(join(dir, '.proof/runs/0001/result.json'), 'utf8'))
+  const liveness = r.results.find(x => x.name === 'app still running')
+
+  assert.equal(liveness.status, 'failed')
+  assert.match(liveness.observed, /killed by SIGSEGV/, liveness.observed)
+  assert.doesNotMatch(liveness.observed, /null/)
 })

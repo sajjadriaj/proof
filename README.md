@@ -107,7 +107,8 @@ Every command takes `--json`. Full flags, exit codes and JSON shapes: [docs/comm
 ## Not just web apps
 
 `run:`, `file:` and `env:` verify anything that runs in a shell — CLIs, pipelines, services
-in any language. `infer` reads JavaScript/TypeScript, Python and Go.
+in any language. `infer` reads JavaScript/TypeScript, Python and Go; `changed` builds its
+import graph from JavaScript/TypeScript and Python.
 
 ```yaml
 goal: the export command produces a complete CSV
