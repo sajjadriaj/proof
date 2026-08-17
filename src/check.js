@@ -693,6 +693,13 @@ async function livenessCheck(serve, server, evidence) {
   // Health is "still answering". The launcher's exit code is a diagnostic detail, not
   // the verdict — `npm run dev` style wrappers exit with 0 even when the app crashed.
   const exitCode = server.proc.exitCode
+  // A signalled process has no exit code, ever — and `sh -c "python3 server.py"` execs, so
+  // the app IS the process proof spawned and a crash arrives as a signal rather than as the
+  // shell's 128+N. Reading only `exitCode` reported that case, the one with the most to say,
+  // as the one with nothing to say: "no longer responding", cause dropped.
+  const ended = exitCode !== null ? describeExit(exitCode, 'exited')
+    : server.proc.signalCode !== null ? `was ${describeSignal(server.proc.signalCode)}`
+      : null
   out.push({
     name: SERVE_CHECK_NAMES[1],
     kind: 'serve',
@@ -701,7 +708,7 @@ async function livenessCheck(serve, server, evidence) {
       ? pass('still responding at end of run')
       : fail(
           'app still responding at end of run',
-          `no longer responding at ${url}${exitCode !== null ? `; the launcher ${describeExit(exitCode, 'exited')}` : ''}`,
+          `no longer responding at ${url}${ended ? `; the launcher ${ended}` : ''}`,
           tail(log),
         )),
     evidence,
