@@ -189,6 +189,30 @@ export function loadSpec(path = SPEC_PATH) {
   return spec
 }
 
+/**
+ * How to run pytest here, read from what the project shows rather than assumed.
+ *
+ * Bare `pytest` is on PATH only inside an activated virtualenv, and `init` is run from
+ * whatever shell you happen to be in: on a repo with a `.venv` the scaffolded check failed
+ * with `pytest: command not found` — a check that cannot pass for a reason that has nothing
+ * to do with the requirement. Same rule as the `Makefile` row below, which already refuses to
+ * scaffold a target the project does not define.
+ */
+export function pytestCommand() {
+  // A binary that is right there needs no resolver, no network and no lockfile to be current.
+  for (const venv of ['.venv', 'venv']) {
+    if (existsSync(`${venv}/bin/pytest`)) return `${venv}/bin/pytest -q`
+  }
+  if (existsSync('uv.lock')) return 'uv run pytest -q'
+  if (existsSync('poetry.lock')) return 'poetry run pytest -q'
+  if (existsSync('Pipfile.lock')) return 'pipenv run pytest -q'
+
+  // `python3 -m pytest`, not bare `pytest`: it works wherever pytest is importable, including
+  // the interpreter an activated venv puts first, and PEP 394 guarantees `python3` exists
+  // where a bare `pytest` console script may simply not be installed.
+  return 'python3 -m pytest -q'
+}
+
 // ponytail: detection is a table, not a plugin system. Add a row per ecosystem.
 const ECOSYSTEMS = [
   {
@@ -202,8 +226,8 @@ const ECOSYSTEMS = [
   },
   { file: 'Cargo.toml', checks: () => [{ name: 'build', run: 'cargo build' }, { name: 'tests', run: 'cargo test' }] },
   { file: 'go.mod', checks: () => [{ name: 'build', run: 'go build ./...' }, { name: 'tests', run: 'go test ./...' }] },
-  { file: 'pyproject.toml', checks: () => [{ name: 'tests', run: 'pytest -q' }] },
-  { file: 'pytest.ini', checks: () => [{ name: 'tests', run: 'pytest -q' }] },
+  { file: 'pyproject.toml', checks: () => [{ name: 'tests', run: pytestCommand() }] },
+  { file: 'pytest.ini', checks: () => [{ name: 'tests', run: pytestCommand() }] },
   { file: 'tox.ini', checks: () => [{ name: 'tests', run: 'tox' }] },
   { file: 'Gemfile', checks: () => [{ name: 'tests', run: 'bundle exec rake test' }] },
   { file: 'pom.xml', checks: () => [{ name: 'tests', run: 'mvn -q test' }] },

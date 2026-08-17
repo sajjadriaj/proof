@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, writeFileSync, mkdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { discoverChecks, makeTargets, discoverServeCommand } from '../src/spec.js'
@@ -57,7 +57,7 @@ test('makeTargets reads targets, not variables or continuations', () => {
 
 test('python without pyproject is still recognised', () => {
   project({ 'pytest.ini': '[pytest]\n' })
-  assert.deepEqual(commands(), ['pytest -q'])
+  assert.deepEqual(commands(), ['python3 -m pytest -q'])
 
   project({ 'tox.ini': '[tox]\n' })
   assert.deepEqual(commands(), ['tox'])
@@ -188,4 +188,30 @@ test('a real port is accepted', async () => {
     serve: { run: 'cargo run', ready_url: 'http://localhost:8080' },
     checks: [{ name: 'c', run: 'true' }],
   }), [])
+})
+
+test('a python project is given a pytest command it can actually run', () => {
+  // Bare `pytest` is on PATH only inside an activated virtualenv. `init` runs in whatever
+  // shell you are in, so on this repo it scaffolded `pytest -q` and the first check failed
+  // with "command not found" — nothing to do with the requirement it was written for.
+  project({ 'pyproject.toml': '[project]\nname = "x"\n' })
+  assert.deepEqual(commands(), ['python3 -m pytest -q'])
+})
+
+test('the venv is preferred when there is one, over every resolver', () => {
+  const dir = project({ 'pyproject.toml': '[project]\nname = "x"\n', 'uv.lock': 'version = 1\n' })
+  mkdirSync(join(dir, '.venv/bin'), { recursive: true })
+  writeFileSync(join(dir, '.venv/bin/pytest'), '#!/bin/sh\n')
+  assert.deepEqual(commands(), ['.venv/bin/pytest -q'])
+})
+
+test('each packaging tool is run through its own runner', () => {
+  project({ 'pyproject.toml': '[project]\nname = "x"\n', 'uv.lock': 'version = 1\n' })
+  assert.deepEqual(commands(), ['uv run pytest -q'])
+
+  project({ 'pyproject.toml': '[project]\nname = "x"\n', 'poetry.lock': '\n' })
+  assert.deepEqual(commands(), ['poetry run pytest -q'])
+
+  project({ 'pytest.ini': '[pytest]\n', 'Pipfile.lock': '{}\n' })
+  assert.deepEqual(commands(), ['pipenv run pytest -q'])
 })
