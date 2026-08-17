@@ -120,15 +120,15 @@ No server, no browser — the whole contract is artifacts and invariants:
 goal: the aggregation produces a complete summary and preserves row counts
 checks:
   - name: unit tests
-    run: pytest -q
+    run: python3 -m pytest -q
 
   - name: pipeline runs on the fixture
-    run: python -m pipeline.aggregate --input fixtures/events.ndjson --out /tmp/summary.parquet
+    run: python3 -m pipeline.aggregate --input fixtures/events.ndjson --out /tmp/summary.parquet
     expect_exit: 0
     expect_output: "rows in: 10000"
 
   - name: nothing was dropped
-    run: python -m pipeline.aggregate --input fixtures/events.ndjson --out /tmp/summary.parquet
+    run: python3 -m pipeline.aggregate --input fixtures/events.ndjson --out /tmp/summary.parquet
     expect_output: "rows out: 10000"
 
   - name: the summary is readable and has the expected columns
