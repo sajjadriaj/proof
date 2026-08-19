@@ -123,6 +123,21 @@ checks:
       kill "$(cat server.pid 2>/dev/null)" 2>/dev/null; cd /; rm -rf "$d"; exit $rc
     expect_exit: 0
 
+  # A repository in a language proof has no detector for had no route source at all, so every
+  # gap list came back empty — which reads as "nothing to verify" for an API fully described
+  # on disk. The document is the one route source that is not a language.
+  - name: an api document is a route source in any language
+    run: >-
+      d=$(mktemp -d) && cd "$d" &&
+      printf 'openapi: 3.0.0\npaths:\n  /orders:\n    get: {}\n' > openapi.yaml &&
+      printf 'class C {}\n' > C.java &&
+      git init -q . && git config user.email t@t.t && git config user.name t &&
+      git add -A && git commit -qm base > /dev/null &&
+      printf 'class C { void x(); }\n' > C.java &&
+      out=$(node "$OLDPWD/bin/proof.js" infer 2>&1); cd /; rm -rf "$d";
+      printf '%s' "$out" | grep -q 'GET /orders is reachable'
+    expect_exit: 0
+
   # Absence of an answer is not an answer. `changed` printed "nothing to verify" outside a
   # repository, where it had not looked at anything at all.
   - name: a blast radius it could not compute is refused, not reported as empty
