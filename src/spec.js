@@ -411,6 +411,9 @@ const serveBlock = cmd => `#
 #   run: ${cmd ?? '<your dev command>'}
 #   ready_url: ${readyUrlFor(cmd)}
 #   timeout: 60
+#
+# An app with no HTTP surface — a worker, a daemon, a queue consumer — is ready when its own
+# log says so. Use \`ready_log: "<a line it prints once up>"\` in place of ready_url.
 `
 
 const header = (n, serveCommand) => `# Acceptance contract. Edit freely — this file is the definition of "done".

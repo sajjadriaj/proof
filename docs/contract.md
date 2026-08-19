@@ -165,7 +165,8 @@ response reports its content-type, which is how an HTML error page usually annou
 
 ### Runtime health
 
-When a `serve` block is present, `proof` adds checks you do not have to write:
+When a `serve` block is present, `proof` adds checks you do not have to write — one set per
+process it starts:
 
 - **`app boots`** — the app answers at `ready_url` within `timeout`. Before starting your
   command, `proof` checks that nothing is *already* answering there. If something is, the
@@ -183,6 +184,110 @@ When a `serve` block is present, `proof` adds checks you do not have to write:
 
 The server's full stdout and stderr are captured to `serve.log` in the evidence bundle on
 every run, pass or fail.
+
+### More than one process
+
+A real application is rarely one process. Write `serve` as a list and each entry starts in the
+order written, every one ready before the next begins — the order in the contract is the
+dependency order:
+
+```yaml
+goal: Orders placed through the API are persisted
+serve:
+  - name: db
+    run: docker compose up postgres
+    ready_log: "database system is ready to accept connections"
+  - name: api
+    run: npm run dev
+    ready_url: http://localhost:3000
+checks:
+  - name: an order persists
+    http: {method: POST, path: /orders, body: {sku: ABC}, expect: {status: 201}}
+```
+
+Each process gets its own `app boots (<name>)`, `app still running (<name>)` and — where it
+asked for one — `app logs clean (<name>)`, and its own `serve-<name>.log` in the evidence
+bundle. One log holding two processes' output is a log that explains neither.
+
+`name` is required once there are two or more, because it is how the run says which one booted,
+which one died and whose log matched. Two processes cannot share one: `app boots (api)` twice
+collapses into a single entry in `result.checks`, where a failure reads as a pass. A single
+process keeps the unsuffixed names and `serve.log`, so every contract written before this and
+every run already recorded is unchanged.
+
+A process that fails to boot **stops the ones after it**. The API cannot come up without its
+database, so every later failure would be about the first one, and a list of failures whose
+causes are all the same failure is one nobody can read.
+
+Teardown runs in reverse — the app before the database it talks to. Killing a dependency first
+makes every dependent log a connection error on the way down, and those lines land in the same
+window `log_must_not_match` reads: a gate would then fail over a teardown `proof` caused.
+
+Relative `path` and `visit` values resolve against the **last** entry that declares a URL,
+since the list runs from what the app needs to the app itself. Where more than one declares
+one, the run says which was chosen rather than leave it implicit:
+
+```
+OBSERVED BUT NOT GATED
+  2 serve blocks declare a URL, so relative `path` and `visit` values resolve against the last
+  of them (http://localhost:3000). Point a check at another with an absolute `url`, or a
+  `browser.base_url`.
+```
+
+### Apps with no HTTP surface
+
+A worker, a queue consumer, a daemon or a database has no URL to answer, so polling one
+cannot say when it is up. Use `ready_log` — a regex its own output must match — in place of
+`ready_url`:
+
+```yaml
+goal: Orders enqueued by the API are drained by the worker
+serve:
+  run: python3 -m myapp.worker
+  ready_log: "consuming from queue"
+  timeout: 30
+checks:
+  - name: the worker drains the queue
+    run: ./scripts/enqueue-one.sh && ./scripts/assert-drained.sh
+```
+
+What proof observed is the matched **line**, not the word "matched" — that line is usually
+where the app states its port, its mode or its worker count:
+
+```
+CHECKS
+  app boots    PASS
+```
+```
+$ proof report
+app boots — consuming from queue (prefetch=16)
+```
+
+Two things are weaker without a URL, and both are said out loud rather than assumed:
+
+- **Liveness** becomes "the process proof started is still there", not "it still answers".
+  That is the strongest thing observable with nothing to ask, and `run:` is often a shell
+  wrapper that outlives the app underneath it — so the check is reported under its own
+  assertion, never folded in with the responding one.
+- **A launcher that exits** (`./up.sh &`, `docker compose up -d`) leaves proof no URL to ask
+  *and* no process it holds, so nothing can be observed at the end of the run at all. The
+  liveness check is then omitted, and the run says why rather than leave a gap in the list:
+
+```
+OBSERVED BUT NOT GATED
+  readiness came from the log and the launcher then exited, so nothing checks whether the app
+  is still running at the end — there is no `ready_url` to ask and no process proof still
+  holds. Add a `ready_url`, or run the app in the foreground.
+```
+
+Give **both** and the log gates readiness while the URL stays the base for relative `http`
+and `browser` paths. That is the case where an app binds its port before it has finished the
+work that makes it usable: polling the port would call that ready, and the log line is what
+says the work is done.
+
+An empty `ready_log` is refused. It matches the empty log the app has not written to yet, so
+every check would run against an app that is not up — the same class of mistake as an empty
+`contains`. A pattern that cannot compile is refused at load, before anything boots.
 
 After the last check, `proof` leaves the app running briefly before judging anything. That
 window is when a crash *caused by* the last check happens — probing liveness immediately
@@ -375,6 +480,9 @@ It is now rejected at load, in under a second.
 A relative `path` or `visit` needs a `serve.ready_url` or a `browser.base_url` to resolve
 against. If neither is present, that is a contract error — `proof` will not fall back to a
 default host.
+
+A contract with `ready_log` and no `ready_url` has no base either, so relative paths are
+refused there the same way — a log line saying the app is up is not an address.
 
 `proof init` scaffolds the `serve` block for you, filled in with whichever of `dev`,
 `start` or `serve` your `package.json` declares. It is written **commented out**: the
