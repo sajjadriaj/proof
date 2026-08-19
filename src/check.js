@@ -1,4 +1,4 @@
-import { spawn } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import { constants } from 'node:os'
 import { mkdirSync, writeFileSync, existsSync, readFileSync, readdirSync, statSync, openSync, readSync, closeSync } from 'node:fs'
 import { join } from 'node:path'
@@ -21,7 +21,22 @@ const fail = (expected, observed, output) => ({ status: 'failed', expected, obse
 
 // Kill the whole process group: `sh -c "npm test"` forks, so signalling the shell
 // alone orphans every grandchild — a timed-out dev server keeps holding its port.
-const kill = p => {
+//
+// Windows has neither process groups nor SIGKILL, so `process.kill(-pid)` throws there and
+// the fallback reached only the shell. The dev server it spawned survived, kept the port, and
+// the *next* run's port check reported a squatter that was proof's own leftover — a failure
+// pointing at an unrelated process, on the machine least able to explain it.
+//
+// The platform is a parameter so the branch is testable off the platform it is for.
+export const kill = (p, platform = process.platform) => {
+  if (platform === 'win32') {
+    // /T is the tree, which is what a negative pid means on POSIX; /F is unconditional, the
+    // closest thing to SIGKILL. Best effort on purpose: a process that exited between the
+    // decision and the call must not take the run down with it.
+    try { spawnSync('taskkill', ['/F', '/T', '/PID', String(p.pid)], { stdio: 'ignore' }) } catch {}
+    try { p.kill() } catch {}
+    return
+  }
   try { process.kill(-p.pid, 'SIGKILL') } catch { try { p.kill('SIGKILL') } catch {} }
 }
 
