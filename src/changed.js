@@ -8,14 +8,15 @@ import { TERMINAL_WIDTH, ellipsize, block, padTo, columnWidth } from './terminal
 
 const JS_EXT = ['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.mts', '.cts', '.vue', '.svelte']
 const PY_EXT = ['.py']
-const SRC_EXT = [...JS_EXT, ...PY_EXT]
+const GO_EXT = ['.go']
+const SRC_EXT = [...JS_EXT, ...PY_EXT, ...GO_EXT]
 const IGNORE = new Set(['node_modules', 'dist', 'build', 'coverage', 'vendor', 'target', '__pycache__', 'out'])
 
 // Paths the scan could not read. An unreadable file used to vanish silently and an
 // unreadable directory used to kill the command — both now degrade the same way, visibly.
 const scanProblems = new Set()
 let depProblem = null
-export const resetScan = () => { scanProblems.clear(); depProblem = null; resetWorkspaces() }
+export const resetScan = () => { scanProblems.clear(); depProblem = null; resetWorkspaces(); resetGoModules() }
 
 export function walk(dir = '.', out = []) {
   let entries
@@ -433,6 +434,80 @@ export const pyLooksLocal = spec => {
 /** The distribution a non-relative module belongs to (`temporalio.client` -> `temporalio`). */
 export const pyPackageOf = spec => (spec.startsWith('.') ? null : spec.split('.')[0] || null)
 
+// --- go ----------------------------------------------------------------------
+// The third language in the graph, and the one where a row in this table is the whole change.
+// `changed` reported every Go file as "not import-scannable" — honest, but it is the answer for
+// an ecosystem `init` already scaffolds build, test and serve commands for.
+//
+// A Go import names a *package*, which is a directory rather than a file. Edges are therefore
+// keyed at the directory, and a changed `.go` file is looked up by the package it belongs to
+// (see `lookupKeys`). That also makes a deletion work for free: the key does not need the file
+// to still exist, which is what the JS side needs `candidates` for.
+
+let goModules = null
+export const resetGoModules = () => { goModules = null }
+
+/**
+ * The module path every `go.mod` in the tree declares, longest first so the most specific
+ * module claims an import. Built once per command, and only when a Go file is actually scanned.
+ */
+const goModuleList = () => {
+  if (goModules) return goModules
+  goModules = []
+
+  const find = dir => {
+    let entries
+    try { entries = readdirSync(dir, { withFileTypes: true }) } catch { scanProblems.add(dir); return }
+    for (const e of entries) {
+      if (e.name.startsWith('.') || IGNORE.has(e.name)) continue
+      const p = dir === '.' ? e.name : join(dir, e.name)
+      if (e.isDirectory()) { find(p); continue }
+      if (e.name !== 'go.mod') continue
+      let source
+      try { source = readFileSync(p, 'utf8') } catch { scanProblems.add(p); continue }
+      const m = source.match(/^\s*module\s+(\S+)/m)
+      if (m) goModules.push({ path: m[1].replace(/\/+$/, ''), dir })
+    }
+  }
+  find('.')
+  goModules.sort((a, b) => b.path.length - a.path.length)
+  return goModules
+}
+
+const GO_IMPORT_BLOCK = /\bimport\s*\(([\s\S]*?)\)/g
+// `import "fmt"`, and the aliased and blank forms — `import m "x"`, `import _ "x"`.
+const GO_IMPORT_ONE = /\bimport\s+(?:[\w.]+\s+)?"([^"]+)"/g
+const GO_QUOTED = /"([^"]+)"/g
+
+export function goImportsOf(src) {
+  const clean = stripComments(src)   // Go comments are the C family stripComments knows
+  const out = []
+  for (const block of clean.matchAll(GO_IMPORT_BLOCK)) {
+    for (const q of block[1].matchAll(GO_QUOTED)) out.push(q[1])
+  }
+  for (const one of clean.matchAll(GO_IMPORT_ONE)) out.push(one[1])
+  return out
+}
+
+/** The directory an import path names, when it is inside a module declared in this repo. */
+export function resolveGoPackage(spec) {
+  for (const { path, dir } of goModuleList()) {
+    const prefix = dir === '.' ? '' : dir
+    if (spec === path) return prefix || '.'
+    if (spec.startsWith(`${path}/`)) return join(prefix, spec.slice(path.length + 1))
+  }
+  return null
+}
+
+/**
+ * Keys to look a file up by.
+ *
+ * A `.go` file is reached through its package, so the edge sits on the directory. Without this
+ * a changed Go file matched nothing and the radius came back empty — the shape this whole
+ * section exists to avoid.
+ */
+export const lookupKeys = f => (GO_EXT.includes(extname(f)) ? [f, dirname(f)] : [f])
+
 export const PKG = 'pkg:'
 
 /** The installed package a bare specifier belongs to (`lodash/fp` -> `lodash`). */
@@ -503,7 +578,23 @@ const PY = {
   local: pyLooksLocal,
 }
 
-const languageOf = file => (PY_EXT.includes(extname(file)) ? PY : JS)
+const GO = {
+  imports: goImportsOf,
+  resolve: spec => resolveGoPackage(spec),
+  // Never fabricated. `resolve` already keys the edge at a directory, which needs nothing to
+  // exist, so the deleted-module case the JS `candidates` exists for is covered without them.
+  candidates: () => [],
+  // Inert: dependency bumps are read from package.json only, so no lookup ever reaches these.
+  // Kept so a stdlib or third-party import is still recorded as an edge to something.
+  packageOf: spec => spec,
+}
+
+const languageOf = file => {
+  const ext = extname(file)
+  if (PY_EXT.includes(ext)) return PY
+  if (GO_EXT.includes(ext)) return GO
+  return JS
+}
 
 /** file -> Set of files importing it */
 export function reverseGraph(files = walk()) {
@@ -548,10 +639,12 @@ export function dependents(seeds, depth = 1, rev = reverseGraph()) {
   for (let d = 0; d < depth; d++) {
     const next = []
     for (const f of frontier) {
-      for (const dep of rev.get(f) ?? []) {
-        if (seen.has(dep)) continue
-        seen.add(dep)
-        next.push(dep)
+      for (const key of lookupKeys(f)) {
+        for (const dep of rev.get(key) ?? []) {
+          if (seen.has(dep)) continue
+          seen.add(dep)
+          next.push(dep)
+        }
       }
     }
     if (!next.length) break

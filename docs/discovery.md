@@ -62,6 +62,23 @@ it would have found is treated as an installed one. Dependency bumps are read fr
 `package.json` only: a version change in `pyproject.toml` shows the file as changed with no
 dependents derived from it.
 
+**Go** resolves against the module path each `go.mod` in the tree declares, most specific
+first — so a monorepo with a `go.mod` per service has each one own its own subtree. A Go import
+names a *package*, which is a directory rather than a file, so every file in that directory
+carries the edge: changing `store/query.go` shows the same importers as changing
+`store/store.go`, because that is what recompiles. Single, aliased, blank (`_`) and
+parenthesised import forms are all read, and a commented-out import is not an edge.
+
+Because the edge sits on the directory, a **deleted** Go package still reports its importers
+without the fabricated candidate paths the JavaScript side needs — the key never required the
+file to exist. An import path outside every declared module is a package edge; nothing local is
+invented for it.
+
+**Rust** is not in the graph. A Rust file's module path is not its file path — `use crate::a::b`
+resolves through the `mod` declarations that build the module tree — so a path-shaped guess
+would under-report the radius, and an under-reported radius says nothing else is affected. That
+is worse than saying nothing, so `changed` still reports Rust files as not import-scannable.
+
 Files `proof` cannot scan for imports — lockfiles, `tsconfig.json`, configs, assets — are
 named rather than passed over. Both can change the whole build, and an empty radius would
 otherwise read as "nothing is affected" when it means "this cannot be derived":
@@ -238,7 +255,7 @@ documents in any language, env reads
 (`process.env`, `os.environ`, `os.getenv`, `os.Getenv`, `os.LookupEnv`) checked against your
 `.env.example`, migration directories mapped to the migrator in your `package.json`.
 `proof` does not guess at semantics it cannot observe. The import graph for the blast radius
-reads JavaScript/TypeScript and Python; for anything else `changed` says the file was not
+reads JavaScript/TypeScript, Python and Go; for anything else `changed` says the file was not
 import-scannable rather than reporting an empty radius as an answer.
 
 Precision matters more than recall here, because a wrong suggestion costs an agent a whole

@@ -123,6 +123,22 @@ checks:
       kill "$(cat server.pid 2>/dev/null)" 2>/dev/null; cd /; rm -rf "$d"; exit $rc
     expect_exit: 0
 
+  # A Go import names a package, so the edge sits on the directory. Every .go file used to come
+  # back as not import-scannable, which is an honest answer and an empty radius.
+  - name: a go file has a derivable blast radius
+    run: >-
+      d=$(mktemp -d) && mkdir -p "$d/.proof" "$d/store" "$d/service" && cd "$d" &&
+      git init -q . && git config user.email t@t.t && git config user.name t &&
+      printf 'module github.com/acme/app\n' > go.mod &&
+      printf 'package store\ntype Order struct{}\n' > store/store.go &&
+      printf 'package service\nimport "github.com/acme/app/store"\nfunc X(o store.Order) {}\n' > service/service.go &&
+      printf 'goal: g\nchecks:\n  - name: t\n    run: "true"\n' > .proof/spec.yaml &&
+      git add -A && git commit -qm base > /dev/null &&
+      printf 'package store\ntype Order struct{ ID int }\n' > store/store.go &&
+      out=$(node "$OLDPWD/bin/proof.js" changed 2>&1); cd /; rm -rf "$d";
+      printf '%s' "$out" | grep -q 'service/service.go'
+    expect_exit: 0
+
   # A repository in a language proof has no detector for had no route source at all, so every
   # gap list came back empty — which reads as "nothing to verify" for an API fully described
   # on disk. The document is the one route source that is not a language.
