@@ -1,9 +1,9 @@
-import { spawn } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import { constants } from 'node:os'
 import { mkdirSync, writeFileSync, existsSync, readFileSync, readdirSync, statSync, openSync, readSync, closeSync } from 'node:fs'
 import { join } from 'node:path'
 import { loadSpec, PROOF_DIR, SPEC_PATH, writeFileAtomic, writeError, contractChange, CONTRACT_CHANGED_NOTICE } from './spec.js'
-import { placeholderChecks, SERVE_CHECK_NAMES } from './validate.js'
+import { placeholderChecks, serveList, serveLabel, serveCheckName, serveBase } from './validate.js'
 import { evidenceGrowth, RUNS, previousResult } from './runs.js'
 import { context as gitContext, fingerprint, inRepo } from './git.js'
 import { testsChanged, fillTestsNotice } from './diff.js'
@@ -21,7 +21,22 @@ const fail = (expected, observed, output) => ({ status: 'failed', expected, obse
 
 // Kill the whole process group: `sh -c "npm test"` forks, so signalling the shell
 // alone orphans every grandchild — a timed-out dev server keeps holding its port.
-const kill = p => {
+//
+// Windows has neither process groups nor SIGKILL, so `process.kill(-pid)` throws there and
+// the fallback reached only the shell. The dev server it spawned survived, kept the port, and
+// the *next* run's port check reported a squatter that was proof's own leftover — a failure
+// pointing at an unrelated process, on the machine least able to explain it.
+//
+// The platform is a parameter so the branch is testable off the platform it is for.
+export const kill = (p, platform = process.platform) => {
+  if (platform === 'win32') {
+    // /T is the tree, which is what a negative pid means on POSIX; /F is unconditional, the
+    // closest thing to SIGKILL. Best effort on purpose: a process that exited between the
+    // decision and the call must not take the run down with it.
+    try { spawnSync('taskkill', ['/F', '/T', '/PID', String(p.pid)], { stdio: 'ignore' }) } catch {}
+    try { p.kill() } catch {}
+    return
+  }
   try { process.kill(-p.pid, 'SIGKILL') } catch { try { p.kill('SIGKILL') } catch {} }
 }
 
@@ -555,6 +570,15 @@ const responds = async url => {
   }
 }
 
+/**
+ * What "ready" means for this serve block, in the terms the contract set. Recorded as the
+ * assertion, so a run can be read back — and so switching between the two signals reports
+ * `Not comparable` rather than a regression in code that never moved.
+ */
+const readyAssertion = serve => serve.ready_log
+  ? `the app logs a line matching /${serve.ready_log}/`
+  : `the app becomes ready at ${serve.ready_url ?? serve.url}`
+
 /** What was observed about how the app was started, and could not be gated on. */
 const serveWarnings = (server, serve) => {
   const out = []
@@ -569,19 +593,30 @@ const serveWarnings = (server, serve) => {
     out.push(`\`${serve.run}\` exited after starting the app, so the app is outside the process group`
       + ' proof stops — it is still running now, and stopping it is yours to do')
   }
+  // The absence of `app still running` from the checks is a decision, so it is said out loud.
+  // With no `ready_url` there is nothing to ask, and with the launcher gone there is no process
+  // proof holds either — a pass there would be a claim about something it lost track of.
+  if (server.detached && !(serve.ready_url ?? serve.url)) {
+    out.push('readiness came from the log and the launcher then exited, so nothing checks whether the app'
+      + ' is still running at the end — there is no `ready_url` to ask and no process proof still holds.'
+      + ' Add a `ready_url`, or run the app in the foreground.')
+  }
   return out.length ? out : undefined
 }
 
 async function boot(serve) {
   const url = serve.ready_url ?? serve.url
-  if (!url) throw new Error('serve needs a ready_url')
+  const pattern = serve.ready_log ? new RegExp(serve.ready_log, 'i') : null
+  if (!url && !pattern) throw new Error('serve needs a ready_url or a ready_log')
   const timeout = serve.timeout ?? 60
 
   // If the port already answers, nothing proof observes afterwards can be attributed to
   // the process it starts. A server that fails to bind then looks exactly like one that
   // booted, and every check runs against whatever was already there.
-  const wasUp = await responds(url)
-  if (serve.reuse_existing !== true && wasUp) {
+  //
+  // Only where there is a port to look at. A `ready_log` app may have no listener at all.
+  const wasUp = url ? await responds(url) : false
+  if (url && serve.reuse_existing !== true && wasUp) {
     throw new Error(
       `something is already responding at ${url} before \`${serve.run}\` was started`
       + ' — proof cannot tell whether checks would reach your app'
@@ -603,6 +638,23 @@ async function boot(serve) {
   const deadline = Date.now() + timeout * 1000
   let detached = false
 
+  /**
+   * What proof observed that made it call the app ready, or null.
+   *
+   * The matched line itself, not the word "matched": that line is usually where the app
+   * states its port, its mode or its worker count, and it is the one thing worth reading
+   * back off a run months later.
+   *
+   * When both signals are given the log gates readiness and the URL stays the base for http
+   * checks — an app can bind its port before it has finished the work that makes it usable.
+   */
+  const observeReady = pattern
+    ? async () => {
+        const line = sink.text().split('\n').find(l => pattern.test(l))
+        return line === undefined ? null : (line.trim() || `matched /${serve.ready_log}/`)
+      }
+    : async () => (await responds(url) ? `ready at ${url}` : null)
+
   while (Date.now() < deadline) {
     // A non-zero exit is the starter reporting failure, and nothing it started is worth
     // waiting for. A zero exit is different: `docker compose up -d` and every other
@@ -621,27 +673,38 @@ async function boot(serve) {
       detached = true
     }
 
-    try {
-      await fetch(url, { signal: AbortSignal.timeout(2000) })
-      // resolves once stdio has closed, so callers can wait for the last log lines
-      return { proc: p, url, reused: wasUp, detached, log, closed }
-    } catch {}
+    const readyBy = await observeReady()
+    // resolves once stdio has closed, so callers can wait for the last log lines
+    if (readyBy !== null) return { proc: p, url, reused: wasUp, detached, log, closed, readyBy }
     await new Promise(r => setTimeout(r, 500))
   }
 
+  // A launcher that detached took the app's output with it, so a `ready_log` that never
+  // matched is most likely a log proof was never given rather than an app that never started.
+  // Saying "no line matched" there sends someone to read a log that is somewhere else.
   if (detached) {
     throw Object.assign(
-      new Error(`\`${serve.run}\` exited 0 without anything answering at ${url} within ${timeout}s`
-        + ' — if it starts the app in the background, check the port; if it is meant to stay in the'
-        + ' foreground, it stopped before proof could reach it'),
+      new Error(pattern
+        ? `\`${serve.run}\` exited 0 and nothing in the output proof captured matched`
+          + ` /${serve.ready_log}/ within ${timeout}s — a command that exits after starting the app`
+          + " sends the app's output wherever it chose, so proof has no log to read. Run the app in"
+          + ' the foreground, or use a `ready_url`.'
+        : `\`${serve.run}\` exited 0 without anything answering at ${url} within ${timeout}s`
+          + ' — if it starts the app in the background, check the port; if it is meant to stay in the'
+          + ' foreground, it stopped before proof could reach it'),
       { proc: p, log: log() },
     )
   }
-  throw Object.assign(new Error(`not ready at ${url} within ${timeout}s`), { proc: p, log: log() })
+  throw Object.assign(
+    new Error(pattern
+      ? `no log line matched /${serve.ready_log}/ within ${timeout}s`
+      : `not ready at ${url} within ${timeout}s`),
+    { proc: p, log: log() },
+  )
 }
 
 /** The app's own log gate, evaluated only once its output has finished arriving. */
-function logCheck(serve, log, evidence, detached) {
+function logCheck(serve, log, evidence, detached, name) {
   if (!serve.log_must_not_match) return null
 
   // A launcher that detached took the app's output with it: what proof captured is the
@@ -649,7 +712,7 @@ function logCheck(serve, log, evidence, detached) {
   // passed a gate the user wrote precisely to catch what was in the log it never saw.
   if (detached) {
     return {
-      name: SERVE_CHECK_NAMES[2],
+      name,
       kind: 'serve',
       asserted: `no runtime log line matches ${JSON.stringify(serve.log_must_not_match)}`,
       ...fail(
@@ -666,7 +729,7 @@ function logCheck(serve, log, evidence, detached) {
   const re = new RegExp(serve.log_must_not_match, 'i')
   const hit = log.split('\n').find(l => re.test(l))
   return {
-    name: SERVE_CHECK_NAMES[2],
+    name,
     kind: 'serve',
     asserted: `no runtime log line matches ${JSON.stringify(serve.log_must_not_match)}`,
     ...(hit
@@ -677,13 +740,37 @@ function logCheck(serve, log, evidence, detached) {
   }
 }
 
-async function livenessCheck(serve, server, evidence) {
+async function livenessCheck(serve, server, evidence, name) {
   const log = server.log()
   const out = []
 
   // `run` is usually a shell wrapper that outlives the app it spawned, so its exit
   // code alone is not liveness. Healthy means the app still answers.
   const url = serve.ready_url ?? serve.url
+
+  // Nothing to ask. Liveness is then whether the process proof started is still there —
+  // honest for an app in the foreground, and the strongest thing observable without a URL.
+  // A launcher that exited by design leaves nothing to observe at all, so no check is
+  // emitted; `serveWarnings` says so rather than let the omission be silent.
+  if (!url) {
+    if (server.detached) return out
+    const exitCode = server.proc.exitCode
+    const ended = exitCode !== null ? describeExit(exitCode, 'exited')
+      : server.proc.signalCode !== null ? `was ${describeSignal(server.proc.signalCode)}`
+        : null
+    out.push({
+      name,
+      kind: 'serve',
+      asserted: 'the process proof started is still running when the checks finish',
+      ...(ended === null
+        ? pass('still running at end of run')
+        : fail('app still running at end of run', `the app ${ended}`, tail(log))),
+      evidence,
+      ms: 0,
+    })
+    return out
+  }
+
   let reachable = false
   try {
     await fetch(url, { signal: AbortSignal.timeout(3000) })
@@ -701,7 +788,7 @@ async function livenessCheck(serve, server, evidence) {
     : server.proc.signalCode !== null ? `was ${describeSignal(server.proc.signalCode)}`
       : null
   out.push({
-    name: SERVE_CHECK_NAMES[1],
+    name,
     kind: 'serve',
     asserted: 'the app is still responding when the checks finish',
     ...(reachable
@@ -793,15 +880,22 @@ export async function check({ json = false, specPath, only } = {}) {
 
   const runDir = nextRunDir()
   const results = []
-  let server = null
+
+  // The processes this contract starts, in the order they must start. Booted sequentially and
+  // each one ready before the next begins: the order in the contract is the dependency order,
+  // and an API that comes up before its database is not a faster run, it is a failing one.
+  const serves = serveList(spec)
+  const started = []
 
   // Captured BEFORE the checks, so the bundle describes the tree that was actually
   // verified rather than whatever it looks like once they finish.
   const git = gitContext()
   const treeBefore = fingerprint()
 
-  const serveLogPath = join(runDir, 'serve.log')
-  const writeServeLog = text => { writeFileSync(serveLogPath, text ?? ''); return [serveLogPath] }
+  // `serve.log` for a single process, so every evidence bundle the docs quote and every path a
+  // recorded run already holds is unchanged. One file per process once there are several.
+  const logPathFor = (s, i) =>
+    join(runDir, serves.length > 1 ? `serve-${slug(serveLabel(s, i))}.log` : 'serve.log')
   let tornDown = false
 
   // A full run honours the contract as written: `app boots`, `app still running` and the log
@@ -812,35 +906,44 @@ export async function check({ json = false, specPath, only } = {}) {
   const needsApp = !only || selected.some(c => 'http' in c || 'browser' in c)
 
   try {
-    if (spec.serve && needsApp) {
-      const t0 = Date.now()
-      try {
-        server = await boot(spec.serve)
-        results.push({
-          name: SERVE_CHECK_NAMES[0],
-          kind: 'serve',
-          asserted: `the app becomes ready at ${spec.serve.ready_url ?? spec.serve.url}`,
-          ...pass(`ready at ${server.url}`),
-          warnings: serveWarnings(server, spec.serve),
-          ms: Date.now() - t0,
-        })
-      } catch (e) {
-        if (e.proc) { kill(e.proc); untrack(e.proc) }
-        results.push({
-          name: SERVE_CHECK_NAMES[0],
-          kind: 'serve',
-          asserted: `the app becomes ready at ${spec.serve.ready_url ?? spec.serve.url}`,
-          ...fail('app becomes ready', e.message, tail(e.log ?? '')),
-          evidence: writeServeLog(e.log),
-          ms: Date.now() - t0,
-        })
+    if (serves.length && needsApp) {
+      for (const [i, s] of serves.entries()) {
+        const t0 = Date.now()
+        const logPath = logPathFor(s, i)
+        try {
+          const server = await boot(s)
+          started.push({ serve: s, index: i, server, logPath })
+          results.push({
+            name: serveCheckName(serves, i, 0),
+            kind: 'serve',
+            asserted: readyAssertion(s),
+            ...pass(server.readyBy),
+            warnings: serveWarnings(server, s),
+            ms: Date.now() - t0,
+          })
+        } catch (e) {
+          if (e.proc) { kill(e.proc); untrack(e.proc) }
+          writeFileSync(logPath, e.log ?? '')
+          results.push({
+            name: serveCheckName(serves, i, 0),
+            kind: 'serve',
+            asserted: readyAssertion(s),
+            ...fail('app becomes ready', e.message, tail(e.log ?? '')),
+            evidence: [logPath],
+            ms: Date.now() - t0,
+          })
+          // Nothing later is worth starting. The API cannot come up without its database, so
+          // every process after this one would fail for a reason that is not its own — and a
+          // list of failures whose causes are all the first one is a list nobody can read.
+          break
+        }
       }
     }
 
     // ponytail: boot failure short-circuits — every downstream check would fail for the same reason.
     if (!results.some(r => r.status === 'failed')) {
       // one session for the run, shared by the http checks in the order they are written
-      const ctx = { baseUrl: spec.serve?.ready_url ?? spec.serve?.url, runDir, cookies: new Map() }
+      const ctx = { baseUrl: serveBase(serves), runDir, cookies: new Map() }
       for (const [i, c] of selected.entries()) {
         const kind = Object.keys(RUNNERS).find(k => k in c)
         if (!kind) throw new Error(`check "${c.name ?? JSON.stringify(c)}" has no known verb (${Object.keys(RUNNERS).join('|')})`)
@@ -861,30 +964,43 @@ export async function check({ json = false, specPath, only } = {}) {
 
     // Runtime verification: a dev server that died halfway through explains every
     // connection error after it, and nothing else in the run would say so.
-    if (server) {
+    if (started.length) {
       // Settle before judging anything. The window exists so late output lands, but it is
       // also the window in which a crash caused by the last check happens: probing liveness
       // first reported "still running" for an app the run had just killed.
       await new Promise(res => setTimeout(res, SETTLE_MS))
 
-      // Now ask whether it survived — while it is still ours to ask.
-      results.push(...await livenessCheck(spec.serve, server, [serveLogPath]))
+      // Now ask whether they survived — while they are all still ours to ask.
+      for (const { serve, index, server, logPath } of started) {
+        results.push(...await livenessCheck(serve, server, [logPath], serveCheckName(serves, index, 1)))
+      }
 
-      // Then stop it and wait for its output to finish arriving. Reading the log while the
+      // Then stop them and wait for their output to finish arriving. Reading a log while the
       // child is still writing loses the last lines, which are exactly the ones that explain
       // a failure.
-      kill(server.proc)
-      untrack(server.proc)
+      //
+      // In reverse: the app before the database it talks to. Killing a dependency first makes
+      // every dependent log a connection error on the way down, and those lines land in the
+      // window `log_must_not_match` reads — failing a gate over a teardown proof caused.
+      for (const { server } of [...started].reverse()) {
+        kill(server.proc)
+        untrack(server.proc)
+      }
       tornDown = true
-      await Promise.race([server.closed, new Promise(res => setTimeout(res, 2000).unref?.())])
+      await Promise.race([
+        Promise.all(started.map(s => s.server.closed)),
+        new Promise(res => setTimeout(res, 2000).unref?.()),
+      ])
 
-      const log = server.log()
-      writeServeLog(log)
-      const gate = logCheck(spec.serve, log, [serveLogPath], server.detached)
-      if (gate) results.push(gate)
+      for (const { serve, index, server, logPath } of started) {
+        const log = server.log()
+        writeFileSync(logPath, log)
+        const gate = logCheck(serve, log, [logPath], server.detached, serveCheckName(serves, index, 2))
+        if (gate) results.push(gate)
+      }
     }
   } finally {
-    if (server && !tornDown) { kill(server.proc); untrack(server.proc) }
+    if (!tornDown) for (const { server } of started) { kill(server.proc); untrack(server.proc) }
   }
 
   // Everything the contract lists before the last selected check, that this run skipped.
@@ -894,7 +1010,7 @@ export async function check({ json = false, specPath, only } = {}) {
     .filter(c => !selected.includes(c))
     .map((c, i) => c.name ?? `check ${i + 1}`)
 
-  const serveSkipped = Boolean(spec.serve) && !needsApp
+  const serveSkipped = serves.length > 0 && !needsApp
   const failures = results.filter(r => r.status === 'failed')
 
   // The product's whole premise: a green test suite is not the same as a satisfied
@@ -914,14 +1030,14 @@ export async function check({ json = false, specPath, only } = {}) {
   // when `app boots` just passed is false: the app was started and answered. What is
   // missing there is narrower, and naming it precisely is the difference between advice
   // someone acts on and a caveat they learn to skip.
-  const started = Boolean(spec.serve) && !serveSkipped
+  const appStarted = serves.length > 0 && !serveSkipped
   // Not on a subset run. Every advisory is a statement about what the whole contract proves,
   // and a subset did not run the whole contract — the INCOMPLETE verdict already says the
   // run makes no completion claim. Reporting "no http check asserts content" for checks that
   // were never selected is a caveat about something the reader did not ask for.
   const advisory = partial ? null
     : failures.length ? null
-    : !acceptance && started ? ADVISORY.liveness_only
+    : !acceptance && appStarted ? ADVISORY.liveness_only
       : !acceptance ? ADVISORY.no_runtime
         : responseChecks.length && !responseChecks.some(assertsContent) ? ADVISORY.status_only
           : null
@@ -952,6 +1068,14 @@ export async function check({ json = false, specPath, only } = {}) {
       // also what the suite now says.
       ...testsWarning(),
       ...results.flatMap(r => (r.warnings ?? []).map(w => `${r.name}: ${w}`)),
+      // Relative `path` and `visit` values resolve against exactly one URL. Where several
+      // processes declare one, which was chosen is not something to leave implicit: a contract
+      // verified against the wrong service passes, for a reason nothing in the run shows.
+      ...(appStarted && serves.filter(s => s.ready_url ?? s.url).length > 1
+        ? [`${serves.filter(s => s.ready_url ?? s.url).length} serve blocks declare a URL, so relative`
+          + ` \`path\` and \`visit\` values resolve against the last of them (${serveBase(serves)}).`
+          + ' Point a check at another with an absolute `url`, or a `browser.base_url`.']
+        : []),
       // A verdict describes the code that was checked. If the tree moved while checking,
       // say so — in an agent loop the editor may still be running.
       ...(treeBefore && fingerprint() !== treeBefore

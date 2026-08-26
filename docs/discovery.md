@@ -62,6 +62,23 @@ it would have found is treated as an installed one. Dependency bumps are read fr
 `package.json` only: a version change in `pyproject.toml` shows the file as changed with no
 dependents derived from it.
 
+**Go** resolves against the module path each `go.mod` in the tree declares, most specific
+first — so a monorepo with a `go.mod` per service has each one own its own subtree. A Go import
+names a *package*, which is a directory rather than a file, so every file in that directory
+carries the edge: changing `store/query.go` shows the same importers as changing
+`store/store.go`, because that is what recompiles. Single, aliased, blank (`_`) and
+parenthesised import forms are all read, and a commented-out import is not an edge.
+
+Because the edge sits on the directory, a **deleted** Go package still reports its importers
+without the fabricated candidate paths the JavaScript side needs — the key never required the
+file to exist. An import path outside every declared module is a package edge; nothing local is
+invented for it.
+
+**Rust** is not in the graph. A Rust file's module path is not its file path — `use crate::a::b`
+resolves through the `mod` declarations that build the module tree — so a path-shaped guess
+would under-report the radius, and an under-reported radius says nothing else is affected. That
+is worse than saying nothing, so `changed` still reports Rust files as not import-scannable.
+
 Files `proof` cannot scan for imports — lockfiles, `tsconfig.json`, configs, assets — are
 named rather than passed over. Both can change the whole build, and an empty radius would
 otherwise read as "nothing is affected" when it means "this cannot be derived":
@@ -127,6 +144,59 @@ handlers it exports, so a route exporting only `POST` is not offered as a `GET` 
 router mounted in the same file carries its prefix; one mounted elsewhere is reported at its
 bare path and says so, rather than being guessed at.
 
+### Routes from an OpenAPI document
+
+A per-framework regex only covers repositories using that framework, and it has to be written
+again for Spring, ASP.NET, Rails, Laravel and Phoenix. A project that publishes an OpenAPI or
+Swagger document has already declared its whole surface in a file `proof` can read, whatever
+language serves it — so `openapi.yaml`, `openapi.json` and the `swagger` spellings are a route
+source in their own right, at the repository root or under `api/`, `docs/`, `spec/` or
+`openapi/`. YAML and JSON are both read.
+
+The document also states example values, so a path with a parameter in it is generated as
+something requestable rather than as a template you have to fill in:
+
+```yaml
+  /orders/{orderId}:
+    parameters:
+      - {name: orderId, in: path, schema: {type: string, example: "ord_42"}}
+```
+
+```
+HIGH    GET /orders/ord_42 is reachable    (openapi.yaml:12)
+```
+
+`example`, `schema.example`, the first `enum` entry and `schema.default` all count, in that
+order. Where the document states no value the path stays a template and is flagged dynamic,
+as a code-derived route would be — `type: integer` does not mean `1` exists, and a generated
+check that 404s costs an agent a whole iteration. `$ref` parameters are not followed.
+
+A `basePath` (Swagger 2) or a relative `servers` URL is a prefix the document states about
+itself, so it is applied silently. An absolute `servers` URL describes a *deployment*, which
+is not necessarily the dev server `proof` starts, so its path is applied and reported:
+
+```
+HIGH    GET /v2/ping is reachable    (openapi.yaml:4)
+          ↳ the prefix /v2 came from the document's `servers` URL, which describes a
+            deployment — confirm the dev server serves it there
+```
+
+**When the document is read** is deliberately narrow. It is a route source when the diff
+touched it — the declared surface changed — or when nothing else in scope could be scanned,
+which is the case where every other detector reports nothing for an API that is fully
+described on disk. Where `proof` can read the code, the code wins: pulling in every path of a
+large document because one unrelated file moved is the kind of list people learn to skip.
+
+A file named `openapi.yaml` that does not declare `openapi:` or `swagger:` is ignored. A
+`paths` mapping alone is not distinctive — build configs have one — and routes read out of one
+are a gap list nobody can act on.
+
+A route both the code and the document declare is one gap, not two.
+
+GraphQL is not read. Its surface is one endpoint, so the route is not the interesting part and
+the operations would each need a request body generated for them — which is guessing at
+semantics, not reading a declaration.
+
 A contract that does not validate does not withhold the gaps — they come from the code, not
 from the contract. What it costs is knowing which are already covered, and the run says so.
 `--write` is refused in that state: appending to a file proof cannot read would add duplicates
@@ -180,11 +250,12 @@ Nothing was scanned — no code file is in scope, so gaps cannot be derived from
 
 Detection is deterministic, not a model call: framework file routes (Next app router,
 `pages/api`), Express/Fastify/Hono handlers, Flask/FastAPI decorators, Go `net/http` and
-chi/gin/echo registrations (Go 1.22 `"POST /path"` patterns included), env reads
+chi/gin/echo registrations (Go 1.22 `"POST /path"` patterns included), OpenAPI and Swagger
+documents in any language, env reads
 (`process.env`, `os.environ`, `os.getenv`, `os.Getenv`, `os.LookupEnv`) checked against your
 `.env.example`, migration directories mapped to the migrator in your `package.json`.
 `proof` does not guess at semantics it cannot observe. The import graph for the blast radius
-reads JavaScript/TypeScript and Python; for anything else `changed` says the file was not
+reads JavaScript/TypeScript, Python and Go; for anything else `changed` says the file was not
 import-scannable rather than reporting an empty radius as an answer.
 
 Precision matters more than recall here, because a wrong suggestion costs an agent a whole

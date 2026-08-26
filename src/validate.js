@@ -17,6 +17,49 @@ export const VERBS = ['run', 'http', 'file', 'env', 'browser']
  */
 export const SERVE_CHECK_NAMES = ['app boots', 'app still running', 'app logs clean']
 
+/**
+ * The processes a contract starts, in the order they must start in.
+ *
+ * A mapping is one process. A list is several, and its order is the dependency order — the
+ * database before the API that needs it — because a real application is more than one process
+ * and a contract that could only start one had to pretend otherwise. Normalised here so every
+ * caller reads a single shape.
+ */
+export const serveList = spec =>
+  spec?.serve === undefined ? [] : Array.isArray(spec.serve) ? spec.serve : [spec.serve]
+
+/** How a serve block is referred to in check names and evidence filenames. */
+export const serveLabel = (s, i) => (typeof s?.name === 'string' && s.name.trim()) || String(i + 1)
+
+/**
+ * Unsuffixed for a single process, so every existing contract, evidence bundle and regression
+ * comparison is untouched. Suffixed once there is more than one, for the reason above: two
+ * checks called `app boots` collapse into one entry in `result.checks`, where a failure reads
+ * as a pass.
+ */
+export const serveCheckName = (list, i, phase) => list.length > 1
+  ? `${SERVE_CHECK_NAMES[phase]} (${serveLabel(list[i], i)})`
+  : SERVE_CHECK_NAMES[phase]
+
+/** Every name proof will add for this contract, so a contract check cannot collide with one. */
+export const serveCheckNames = spec => {
+  const list = serveList(spec)
+  return list.flatMap((_, i) => SERVE_CHECK_NAMES.map((__, phase) => serveCheckName(list, i, phase)))
+}
+
+/**
+ * The URL relative `path` and `visit` values resolve against.
+ *
+ * The last serve block that declares one. The list is written in dependency order — what the
+ * app needs first, the app itself last — so the last URL is the app under test. Where more
+ * than one block declares a URL the run reports which was chosen: picking silently is how a
+ * contract ends up verified against a service it was never about.
+ */
+export const serveBase = list => {
+  const urls = list.map(s => s?.ready_url ?? s?.url).filter(u => typeof u === 'string')
+  return urls.length ? urls[urls.length - 1] : undefined
+}
+
 export const PLACEHOLDER_RUN = new Map([
   ['echo "replace me with a real command"', '`proof init` wrote it because no build or test command was discovered'],
   ['echo "TODO: your migrate command"', '`proof infer` wrote it because no migration tool was detected'],
@@ -35,7 +78,7 @@ export const isPlaceholderCommand = value => PLACEHOLDER_RUN.has(String(value).t
 // that never runs, and a check that asserts nothing must never report PASS.
 export const ALLOWED = {
   '': ['goal', 'requirement', 'serve', 'checks'],
-  serve: ['run', 'ready_url', 'url', 'timeout', 'log_must_not_match', 'reuse_existing'],
+  serve: ['name', 'run', 'ready_url', 'ready_log', 'url', 'timeout', 'log_must_not_match', 'reuse_existing'],
   check: ['name', 'timeout', ...VERBS, 'expect_exit', 'expect_output'],
   'check.http': ['method', 'path', 'url', 'headers', 'body', 'expect', 'follow_redirects'],
   'check.http.expect': ['status', 'body_contains', 'body_not_contains', 'json'],
@@ -289,38 +332,83 @@ export function validateSpec(spec) {
   walk(spec, '', 'spec', problems)
 
   if (spec.serve !== undefined) {
-    if (!isPlain(spec.serve)) problems.push('spec › serve: must be a mapping')
-    else {
-      // The top-level walk already recurses into `serve`; walking it again double-reported.
-      if (!spec.serve.run) problems.push('spec › serve: needs a `run` command')
-      if (!spec.serve.ready_url && !spec.serve.url) problems.push('spec › serve: needs a `ready_url` to poll')
+    const asList = Array.isArray(spec.serve)
+    if (!asList && !isPlain(spec.serve)) {
+      problems.push('spec › serve: must be a mapping, or a list of mappings to start in order')
+    } else if (asList && spec.serve.length === 0) {
+      problems.push('spec › serve: is an empty list — give it a process to start, or remove it')
+    } else {
+      const list = serveList(spec)
+      const labels = new Map()
 
-      // A scheme-less ready_url can never be fetched, so proof would poll for the whole
-      // timeout and then report the app as never ready — blaming the app for a typo here.
-      for (const key of ['ready_url', 'url']) {
-        const value = spec.serve[key]
-        if (value === undefined) continue
-        mustBe(value, 'string', `spec › serve › ${key}`, problems)
-        if (typeof value === 'string' && !ABSOLUTE.test(value)) {
-          problems.push(`spec › serve › ${key}: must be absolute (http:// or https://) — "${value}" cannot be fetched`)
+      list.forEach((s, i) => {
+        const at = asList ? `spec › serve[${i}]` : 'spec › serve'
+        if (!isPlain(s)) return problems.push(`${at}: must be a mapping`)
+
+        // The top-level walk recurses into a `serve` mapping but not into a list, so list
+        // entries are walked here — and only here, or the mapping form reports every unknown
+        // key twice and a reader looks for a second problem that is not there.
+        if (asList) walk(s, 'serve', at, problems)
+
+        if (!s.run) problems.push(`${at}: needs a \`run\` command`)
+
+        // With more than one process, the name is how the run says which one booted, which one
+        // died, and whose log held the offending line. An ordinal would do that badly.
+        mustBe(s.name, 'string', `${at} › name`, problems)
+        if (list.length > 1) {
+          if (!(typeof s.name === 'string' && s.name.trim())) {
+            problems.push(`${at}: needs a \`name\` — with more than one process, names are how the run`
+              + ' reports which one booted, which one died, and whose log matched')
+          } else {
+            // Two processes sharing a name produce two checks called `app boots (api)`, which
+            // collapse into one entry in `result.checks` — a failure reads as a pass there.
+            const key = slug(s.name)
+            if (labels.has(key)) {
+              problems.push(`${at} › name: duplicate serve name (also serve[${labels.get(key)}])`
+                + ' — names identify these processes in results and evidence filenames')
+            } else labels.set(key, i)
+          }
         }
-        // Placeholder first, and only one problem for one mistake: `<port>` also fails to
-        // parse, so reporting both would list the same error twice in different words.
-        if (!mustBeRequestable(value, `spec › serve › ${key}`, problems)) {
-          mustParse(value, `spec › serve › ${key}`, problems)
+
+        // Either readiness signal will do. A URL is the one an HTTP app can show; a worker, a
+        // queue consumer, a daemon or a database has no URL to answer, and requiring one meant
+        // nothing without an HTTP surface could have a serve block at all.
+        if (!s.ready_url && !s.url && !s.ready_log) {
+          problems.push(`${at}: needs a \`ready_url\` to poll, or a \`ready_log\` pattern its output must match`
+            + ' — proof will not call an app ready without observing it')
         }
-      }
-      if (isPlaceholderCommand(spec.serve.run)) {
-        problems.push(
-          'spec › serve › run: this is still the placeholder proof scaffolded — '
-          + `${PLACEHOLDER_RUN.get(String(spec.serve.run).trim())}. Replace it with the command that`
-          + ' starts this project, or delete the serve block.',
-        )
-      }
-      badRegex(spec.serve.log_must_not_match, 'spec › serve › log_must_not_match', problems)
-      mustBe(spec.serve.reuse_existing, 'boolean', 'spec › serve › reuse_existing', problems)
-      mustBe(spec.serve.timeout, 'number', 'spec › serve › timeout', problems)
-      mustBePositive(spec.serve.timeout, 'spec › serve › timeout', problems)
+
+        // A scheme-less ready_url can never be fetched, so proof would poll for the whole
+        // timeout and then report the app as never ready — blaming the app for a typo here.
+        for (const key of ['ready_url', 'url']) {
+          const value = s[key]
+          if (value === undefined) continue
+          mustBe(value, 'string', `${at} › ${key}`, problems)
+          if (typeof value === 'string' && !ABSOLUTE.test(value)) {
+            problems.push(`${at} › ${key}: must be absolute (http:// or https://) — "${value}" cannot be fetched`)
+          }
+          // Placeholder first, and only one problem for one mistake: `<port>` also fails to
+          // parse, so reporting both would list the same error twice in different words.
+          if (!mustBeRequestable(value, `${at} › ${key}`, problems)) {
+            mustParse(value, `${at} › ${key}`, problems)
+          }
+        }
+        if (isPlaceholderCommand(s.run)) {
+          problems.push(
+            `${at} › run: this is still the placeholder proof scaffolded — `
+            + `${PLACEHOLDER_RUN.get(String(s.run).trim())}. Replace it with the command that`
+            + ' starts this project, or delete the serve block.',
+          )
+        }
+        badRegex(s.log_must_not_match, `${at} › log_must_not_match`, problems)
+        // An empty pattern matches the first thing the app prints — or the empty log before it
+        // has printed anything — so every check would run against an app that is not up yet.
+        badRegex(s.ready_log, `${at} › ready_log`, problems)
+        mustAssertSomething(s.ready_log, `${at} › ready_log`, problems)
+        mustBe(s.reuse_existing, 'boolean', `${at} › reuse_existing`, problems)
+        mustBe(s.timeout, 'number', `${at} › timeout`, problems)
+        mustBePositive(s.timeout, `${at} › timeout`, problems)
+      })
     }
   }
 
@@ -336,7 +424,7 @@ export function validateSpec(spec) {
     return problems
   }
 
-  const baseUrl = spec.serve?.ready_url ?? spec.serve?.url
+  const baseUrl = serveBase(serveList(spec))
 
   // Names key the results map, the evidence filenames, and `--only`. Two checks sharing
   // one means the later result silently replaces the earlier — a failed check can be
@@ -353,7 +441,9 @@ export function validateSpec(spec) {
       )
     } else byslug.set(key, { i, name: c.name })
 
-    if (SERVE_CHECK_NAMES.some(n => slug(n) === key)) {
+    // The names proof will add for *this* contract, not the three bare ones: with several
+    // processes they carry a suffix, and `app boots (api)` collides just as destructively.
+    if (serveCheckNames(spec).some(n => slug(n) === key)) {
       problems.push(
         `check[${i}] "${c.name}": proof adds a check of this name itself when the contract has a `
         + 'serve block. Two checks with one name collapse into a single entry in `result.checks`, '

@@ -123,6 +123,61 @@ checks:
       kill "$(cat server.pid 2>/dev/null)" 2>/dev/null; cd /; rm -rf "$d"; exit $rc
     expect_exit: 0
 
+  # An app with no HTTP surface — a worker, a daemon, a queue consumer. Polling a URL was the
+  # only readiness proof knew, so this shape could not have a serve block at all. The marker
+  # file is written before the ready line, so a contract that did not wait would race it.
+  - name: an app with no http surface can be verified
+    run: >-
+      d=$(mktemp -d) && mkdir -p "$d/.proof" && cd "$d" &&
+      printf 'setTimeout(()=>{require("fs").writeFileSync("ready.txt","up");console.log("worker consuming from queue")},500)\nsetInterval(()=>{},1e4)\n' > w.js &&
+      printf 'goal: g\nserve:\n  run: node w.js\n  ready_log: "consuming from queue"\n  timeout: 20\nchecks:\n  - name: marker\n    file: ready.txt\n' > .proof/spec.yaml &&
+      node "$OLDPWD/bin/proof.js" check > /dev/null 2>&1; rc=$?; cd /; rm -rf "$d"; exit $rc
+    expect_exit: 0
+
+  # A Go import names a package, so the edge sits on the directory. Every .go file used to come
+  # back as not import-scannable, which is an honest answer and an empty radius.
+  - name: a go file has a derivable blast radius
+    run: >-
+      d=$(mktemp -d) && mkdir -p "$d/.proof" "$d/store" "$d/service" && cd "$d" &&
+      git init -q . && git config user.email t@t.t && git config user.name t &&
+      printf 'module github.com/acme/app\n' > go.mod &&
+      printf 'package store\ntype Order struct{}\n' > store/store.go &&
+      printf 'package service\nimport "github.com/acme/app/store"\nfunc X(o store.Order) {}\n' > service/service.go &&
+      printf 'goal: g\nchecks:\n  - name: t\n    run: "true"\n' > .proof/spec.yaml &&
+      git add -A && git commit -qm base > /dev/null &&
+      printf 'package store\ntype Order struct{ ID int }\n' > store/store.go &&
+      out=$(node "$OLDPWD/bin/proof.js" changed 2>&1); cd /; rm -rf "$d";
+      printf '%s' "$out" | grep -q 'service/service.go'
+    expect_exit: 0
+
+  # A real application is more than one process. The api refuses to start until the db has
+  # written its marker, so a run that booted these out of order could not pass — and the
+  # per-process check names are what a failure has to be readable through.
+  - name: a multi-process stack boots in dependency order
+    run: >-
+      d=$(mktemp -d) && mkdir -p "$d/.proof" && cd "$d" &&
+      printf 'require("fs").writeFileSync("db-up","1")\nconsole.log("db accepting connections")\nsetInterval(()=>{},1e4)\n' > db.js &&
+      printf 'if(!require("fs").existsSync("db-up")){console.error("no db");process.exit(1)}\nrequire("http").createServer((q,s)=>s.end("ok")).listen(8451)\nconsole.log("api up")\n' > api.js &&
+      printf 'goal: g\nserve:\n  - name: db\n    run: node db.js\n    ready_log: "accepting connections"\n    timeout: 20\n  - name: api\n    run: node api.js\n    ready_url: http://127.0.0.1:8451/\n    timeout: 20\nchecks:\n  - name: api answers\n    http: {path: /, expect: {body_contains: "ok"}}\n' > .proof/spec.yaml &&
+      out=$(node "$OLDPWD/bin/proof.js" check 2>&1); rc=$?; cd /; rm -rf "$d";
+      test $rc -eq 0 && printf '%s' "$out" | grep -q 'app boots (api)'
+    expect_exit: 0
+
+  # A repository in a language proof has no detector for had no route source at all, so every
+  # gap list came back empty — which reads as "nothing to verify" for an API fully described
+  # on disk. The document is the one route source that is not a language.
+  - name: an api document is a route source in any language
+    run: >-
+      d=$(mktemp -d) && cd "$d" &&
+      printf 'openapi: 3.0.0\npaths:\n  /orders:\n    get: {}\n' > openapi.yaml &&
+      printf 'class C {}\n' > C.java &&
+      git init -q . && git config user.email t@t.t && git config user.name t &&
+      git add -A && git commit -qm base > /dev/null &&
+      printf 'class C { void x(); }\n' > C.java &&
+      out=$(node "$OLDPWD/bin/proof.js" infer 2>&1); cd /; rm -rf "$d";
+      printf '%s' "$out" | grep -q 'GET /orders is reachable'
+    expect_exit: 0
+
   # Absence of an answer is not an answer. `changed` printed "nothing to verify" outside a
   # repository, where it had not looked at anything at all.
   - name: a blast radius it could not compute is refused, not reported as empty

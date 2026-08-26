@@ -109,6 +109,115 @@ function goRoutes(file) {
 const PY_ENV = /os\.(?:environ\s*(?:\[\s*['"]([A-Z][A-Z0-9_]{2,})['"]\s*\]|\.get\(\s*['"]([A-Z][A-Z0-9_]{2,})['"])|getenv\(\s*['"]([A-Z][A-Z0-9_]{2,})['"])/g
 const GO_ENV = /os\.(?:Getenv|LookupEnv)\(\s*"([A-Z][A-Z0-9_]{2,})"/g
 
+// --- declared api surface ----------------------------------------------------
+// The one route source that is not a language. A per-framework regex has to be written again
+// for Spring, ASP.NET, Rails, Laravel and Phoenix, and each one only covers repositories that
+// use that framework. A project publishing an OpenAPI document has already declared its whole
+// surface in a file proof can read — and the document carries example values, so a path with
+// a parameter in it can be generated as something requestable rather than as a template
+// someone has to fill in by hand.
+
+const OPENAPI_NAME = /(?:^|\/)(?:openapi|swagger)\.(?:ya?ml|json)$/i
+
+// Where to look when the diff does not point at one. Conventional locations only: reading
+// routes out of a file that is not an API description is a gap list nobody can act on.
+const OPENAPI_CANDIDATES = ['', 'api/', 'docs/', 'spec/', 'openapi/']
+  .flatMap(dir => ['openapi', 'swagger'].flatMap(name => ['.yaml', '.yml', '.json'].map(ext => `${dir}${name}${ext}`)))
+
+/**
+ * Which OpenAPI documents count as a route source for this scope.
+ *
+ * In the diff means the declared surface itself changed. Otherwise only when nothing else in
+ * scope could be scanned — the case where every other detector reports nothing for a
+ * repository that has plainly described its entire API. Where proof *can* read the code, the
+ * code wins: pulling in every path of a large document because one unrelated file moved is
+ * the kind of list people learn to skip.
+ */
+export function apiSpecsIn(files) {
+  const inScope = files.filter(f => OPENAPI_NAME.test(f))
+  if (inScope.length) return inScope
+  if (files.some(f => CODE.test(f) && !isTestFile(f))) return []
+  return OPENAPI_CANDIDATES.filter(existsSync)
+}
+
+const HTTP_METHODS = new Set(['get', 'post', 'put', 'patch', 'delete', 'head', 'options'])
+
+/** A concrete value the document itself states for a path parameter, or null. */
+const paramValue = p => {
+  const schema = p?.schema ?? {}
+  // Only what is written down. Deriving `1` from `type: integer` would invent an id that very
+  // likely does not exist, and a generated check that 404s costs an agent a whole iteration.
+  const found = [p?.example, schema.example, Array.isArray(schema.enum) ? schema.enum[0] : undefined, schema.default]
+    .find(v => v !== undefined && v !== null && typeof v !== 'object')
+  return found === undefined ? null : String(found)
+}
+
+/** Path-parameter values, operation-level overriding path-level as OpenAPI specifies. */
+const pathExamples = (item, op) => {
+  const out = {}
+  const declared = [item?.parameters, op?.parameters].filter(Array.isArray).flat()
+  for (const p of declared) {
+    // `$ref` parameters are not followed: resolving them needs the whole document graph, and
+    // an unfilled template is reported as dynamic rather than guessed at.
+    if (p?.in !== 'path' || typeof p?.name !== 'string') continue
+    const value = paramValue(p)
+    if (value !== null) out[p.name] = value
+  }
+  return out
+}
+
+/** The path prefix the document says its operations live under. */
+const serverPrefix = doc => {
+  const raw = typeof doc.basePath === 'string' ? doc.basePath                  // swagger 2
+    : typeof doc.servers?.[0]?.url === 'string' ? doc.servers[0].url           // openapi 3
+      : null
+  if (raw === null) return { prefix: '', fromServer: false }
+  if (raw.startsWith('/')) return { prefix: raw.replace(/\/+$/, ''), fromServer: false }
+  // An absolute server URL describes a deployment, which is not necessarily the dev server
+  // proof starts. Its path is applied and said out loud rather than trusted silently.
+  try {
+    return { prefix: new URL(raw).pathname.replace(/\/+$/, ''), fromServer: true }
+  } catch { return { prefix: '', fromServer: false } }   // a templated `{host}/v1` is not resolvable
+}
+
+export function openApiRoutes(file) {
+  const src = read(file)
+  let doc
+  // YAML is a superset of JSON, so one parser reads both spellings of the document.
+  try { doc = YAML.parse(src) } catch { return [] }
+
+  // A document that says what it is. A `paths` mapping alone is not distinctive — plenty of
+  // config files have one.
+  if (!doc || typeof doc !== 'object' || (!doc.openapi && !doc.swagger)) return []
+  if (!doc.paths || typeof doc.paths !== 'object') return []
+
+  const { prefix, fromServer } = serverPrefix(doc)
+  const out = []
+
+  for (const [template, item] of Object.entries(doc.paths)) {
+    if (!template.startsWith('/') || !item || typeof item !== 'object') continue
+    // The template is the most distinctive string on its own line, so it locates the
+    // operation without walking a YAML CST — the same technique the regex detectors use.
+    const at = `${file}:${lineOf(src, Math.max(0, src.indexOf(template)))}`
+
+    for (const [method, op] of Object.entries(item)) {
+      if (!HTTP_METHODS.has(method.toLowerCase())) continue
+      const examples = pathExamples(item, op)
+      const path = `${prefix}${template}`
+        .replace(/\/{2,}/g, '/')
+        .replace(/\{([^}]+)\}/g, (whole, name) => examples[name] ?? whole)
+
+      out.push({
+        method: method.toUpperCase(),
+        path,
+        at,
+        ...(fromServer && prefix ? { prefixed: prefix } : {}),
+      })
+    }
+  }
+  return out
+}
+
 
 export function routesIn(file) {
   if (file.endsWith('.py')) return pyRoutes(file)
@@ -254,25 +363,41 @@ export function findGaps(files, existingChecks = [], { reportUncovered = true } 
   // Application code only: a route in a fixture is a scenario, not a surface to verify.
   const code = files.filter(f => CODE.test(f) && !isTestFile(f))
 
-  for (const f of code) {
-    for (const r of routesIn(f)) {
-      if (routes.some(a => a.method === r.method && a.path === r.path)) continue
-      const dynamic = isDynamicPath(r.path)
-      const notes = [
-        dynamic ? 'dynamic segment — replace with a real value' : null,
-        // The route is real; where the app mounts it is decided in a file this scan has
-        // not read. Generating the bare path silently would produce a check that 404s.
-        r.mountable ? 'declared on a router — confirm the prefix the app mounts it under' : null,
-      ].filter(Boolean)
+  const found = [
+    ...code.flatMap(f => routesIn(f)),
+    ...apiSpecsIn(files).flatMap(f => openApiRoutes(f)),
+  ]
 
-      push({
-        severity: 'HIGH',
-        title: `${r.method} ${r.path} is reachable`,
-        at: r.at,
-        note: notes.length ? notes.join('; ') : null,
-        check: { name: `${r.method.toLowerCase()} ${r.path}`, http: { method: r.method, path: r.path, expect: { status: 200 } } },
-      })
-    }
+  // One gap per route, whoever declared it. Two sources can name the same endpoint — a
+  // handler and the document describing it — and reporting it twice makes the same work
+  // look like two pieces of it.
+  const seen = new Set()
+
+  for (const r of found) {
+    if (routes.some(a => a.method === r.method && a.path === r.path)) continue
+    const key = `${r.method} ${r.path}`
+    if (seen.has(key)) continue
+    seen.add(key)
+
+    const dynamic = isDynamicPath(r.path)
+    const notes = [
+      dynamic ? 'dynamic segment — replace with a real value' : null,
+      // The route is real; where the app mounts it is decided in a file this scan has
+      // not read. Generating the bare path silently would produce a check that 404s.
+      r.mountable ? 'declared on a router — confirm the prefix the app mounts it under' : null,
+      r.prefixed
+        ? `the prefix ${r.prefixed} came from the document's \`servers\` URL, which describes a`
+          + ' deployment — confirm the dev server serves it there'
+        : null,
+    ].filter(Boolean)
+
+    push({
+      severity: 'HIGH',
+      title: `${r.method} ${r.path} is reachable`,
+      at: r.at,
+      note: notes.length ? notes.join('; ') : null,
+      check: { name: `${r.method.toLowerCase()} ${r.path}`, http: { method: r.method, path: r.path, expect: { status: 200 } } },
+    })
   }
 
   const declared = declaredEnv()
@@ -398,9 +523,11 @@ export function infer({ json = false, write = false, depth = 1, base = 'HEAD', s
   // their contract four lines below where they were looking.
   const scaffolded = needsServe ? commentedServeLine(specPath ?? SPEC_PATH) : null
 
-  // Only code files can yield route/env gaps. Reporting "no gaps found" when nothing was
-  // scannable is a clean bill of health for a scan that never ran.
+  // Only code files and API documents can yield route/env gaps. Reporting "no gaps found"
+  // when nothing was scannable is a clean bill of health for a scan that never ran — and
+  // reporting "0 scannable" above a list of routes read from openapi.yaml contradicts itself.
   const scanned = scope.filter(f => CODE.test(f) && !isTestFile(f) && !unreadable.has(f)).length
+    + apiSpecsIn(scope).filter(f => !unreadable.has(f)).length
   // Said out loud: "0 scannable" for a diff of nothing but tests should not look like a
   // scan that failed.
   const testFiles = scope.filter(f => CODE.test(f) && isTestFile(f)).length
@@ -469,7 +596,9 @@ function printHuman(o, gaps, write) {
           + ' application gaps from those.\n'
         : o.files > 0
           ? '\nNo file in scope is one proof can scan for gaps — its route and environment detectors'
-            + ' read JavaScript, TypeScript, Python and Go. `run:` checks work in any language.\n'
+            + ' read JavaScript, TypeScript, Python and Go, and any language at all through an'
+            + ' OpenAPI document (openapi.yaml, swagger.json).'
+            + ' `run:` checks work in any language.\n'
           : '\nNothing is in scope, so there are no gaps to derive from this change.\n'
     console.log(`\n${block(nothingScanned.trim(), '')}\n`)
     return
