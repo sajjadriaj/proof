@@ -19,7 +19,7 @@ backed by evidence.
 ## Install
 
 ```bash
-npm install -g proof-cli
+npm i -g github:sajjadriaj/proof
 ```
 
 Browser checks additionally need Playwright (optional — only if your contract uses the
@@ -153,6 +153,10 @@ The agent stops when the contract passes — not when it feels done. Details:
 | [docs/agents.md](docs/agents.md) | The agent loop and `proof guard` |
 | [docs/examples.md](docs/examples.md) | Worked contracts beyond web UI |
 | [docs/design.md](docs/design.md) | Design principles, non-goals, development |
+
+Running the test suite needs the browser binaries, the same ones the `browser:` verb needs:
+`npx playwright install chromium`. Without them 49 of the browser tests fail on a clean
+clone, which looks like a broken project and is a missing download.
 
 ## Non-goals
 
