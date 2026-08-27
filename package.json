@@ -1,5 +1,5 @@
 {
-  "name": "proof-cli",
+  "name": "@sajjadriaj/proof",
   "version": "0.1.0",
   "description": "Independent verification layer for AI coding agents",
   "type": "module",
