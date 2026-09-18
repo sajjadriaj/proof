@@ -53,6 +53,34 @@ only in terminal output would be missing from the document actually making the c
 `proof report --list` shows every recorded run — id, verdict, timestamp, how many checks
 passed, and the goal — so you can pick one without guessing at ids.
 
+### Checks that do not agree with themselves
+
+Every run of a contract is on disk, and for a long time the only one ever consulted was the
+last. A check that passes four runs in five rendered exactly like one that always passes — and
+a verdict resting on it means less than it looks, which is the thing this tool exists to
+prevent.
+
+Each run now reads the last ten of the same contract. A check whose history holds **both**
+outcomes for the same assertion is named, on a green run as much as a red one:
+
+```
+OBSERVED BUT NOT GATED
+  coin flip has not agreed with itself: it failed 1 of the last 2 runs that asserted the same
+  thing, and passed the rest. A check that flakes makes every verdict it appears in weaker —
+  find the nondeterminism, or make the check wait for what it needs.
+```
+
+Two rules keep it from crying wolf:
+
+- **A regression is not a flake.** The window is the history *before* this run. A check that
+  passed ten times and fails now is the change's doing, and calling that a flake would excuse
+  it. It gets the `Regression:` marker instead.
+- **Like-for-like or not at all.** A check whose assertion was edited is a different check,
+  and its earlier outcomes say nothing about it — the same rule the regression marker follows.
+
+It never changes the verdict or the exit code. `--json` carries `flaky` as
+`{check, failed, of}`.
+
 ### Stale reports
 
 A report describes the code as it was when the run happened. If the tree has changed since,

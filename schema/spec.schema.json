@@ -1,0 +1,325 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/sajjadriaj/proof/main/schema/spec.schema.json",
+  "title": "proof acceptance contract",
+  "description": "The definition of \"done\" for one requirement. `proof check` is what decides whether a contract is valid — this schema is for editor completion, and cannot express every rule the validator enforces.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "goal",
+    "checks"
+  ],
+  "properties": {
+    "goal": {
+      "type": "string",
+      "description": "The requirement these checks are meant to prove. A verdict means nothing without it."
+    },
+    "requirement": {
+      "type": "string"
+    },
+    "serve": {
+      "description": "The process, or processes in dependency order, to start before the checks.",
+      "anyOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "run": {
+              "type": "string"
+            },
+            "ready_url": {
+              "type": "string",
+              "format": "uri",
+              "pattern": "^https?://"
+            },
+            "ready_log": {
+              "type": "string",
+              "minLength": 1,
+              "description": "A regex the process output must match. For an app with no URL to poll."
+            },
+            "url": {
+              "type": "string"
+            },
+            "timeout": {
+              "type": "number",
+              "exclusiveMinimum": 0
+            },
+            "log_must_not_match": {
+              "type": "string"
+            },
+            "reuse_existing": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "run"
+          ]
+        },
+        {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "run": {
+                "type": "string"
+              },
+              "ready_url": {
+                "type": "string",
+                "format": "uri",
+                "pattern": "^https?://"
+              },
+              "ready_log": {
+                "type": "string",
+                "minLength": 1,
+                "description": "A regex the process output must match. For an app with no URL to poll."
+              },
+              "url": {
+                "type": "string"
+              },
+              "timeout": {
+                "type": "number",
+                "exclusiveMinimum": 0
+              },
+              "log_must_not_match": {
+                "type": "string"
+              },
+              "reuse_existing": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "run"
+            ]
+          },
+          "minItems": 1
+        }
+      ]
+    },
+    "checks": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "timeout": {
+            "type": "number",
+            "exclusiveMinimum": 0
+          },
+          "run": {
+            "type": "string"
+          },
+          "http": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "method": {
+                "type": "string"
+              },
+              "path": {
+                "type": "string"
+              },
+              "url": {
+                "type": "string"
+              },
+              "headers": {
+                "type": "object"
+              },
+              "body": {},
+              "expect": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "status": {
+                    "type": "integer"
+                  },
+                  "statuses": {},
+                  "headers": {
+                    "type": "object"
+                  },
+                  "body_contains": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "body_not_contains": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "json": {
+                    "description": "Subset match. Type tokens: <string>, <number>, <boolean>, <array>, <object>, <null>, <any>"
+                  }
+                }
+              },
+              "follow_redirects": {
+                "type": "boolean"
+              },
+              "concurrent": {}
+            }
+          },
+          "file": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "path": {
+                    "type": "string"
+                  },
+                  "exists": {
+                    "type": "boolean"
+                  },
+                  "contains": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "not_contains": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                }
+              }
+            ]
+          },
+          "env": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "matches": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                }
+              }
+            ]
+          },
+          "browser": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "visit": {
+                "type": "string"
+              },
+              "flow": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "visit": {
+                      "type": "string"
+                    },
+                    "fill": {
+                      "type": "object"
+                    },
+                    "click": {
+                      "type": "string"
+                    },
+                    "expect_text": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "expect_request": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "properties": {
+                        "method": {
+                          "type": "string"
+                        },
+                        "path": {
+                          "type": "string"
+                        },
+                        "path_matches": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "url": {
+                          "type": "string"
+                        },
+                        "timeout_ms": {
+                          "type": "number",
+                          "exclusiveMinimum": 0
+                        },
+                        "status": {
+                          "type": "integer"
+                        }
+                      }
+                    },
+                    "expect_url": {
+                      "type": "string"
+                    },
+                    "wait": {
+                      "type": "number"
+                    }
+                  }
+                }
+              },
+              "base_url": {
+                "type": "string",
+                "pattern": "^https?://"
+              },
+              "expect_no_console_errors": {
+                "type": "boolean"
+              }
+            }
+          },
+          "expect_exit": {
+            "type": "integer"
+          },
+          "expect_output": {
+            "type": "string",
+            "minLength": 1
+          },
+          "expect_under_ms": {
+            "type": "number",
+            "exclusiveMinimum": 0,
+            "description": "The check's own wall clock, spawn included. One measurement, not a benchmark."
+          },
+          "retry_for_ms": {},
+          "results": {},
+          "capture": {
+            "type": "object",
+            "description": "Values later checks use as ${name}. Selectors: json.<path>, header.<name>, status, output, match:<regex>",
+            "additionalProperties": {
+              "type": "string",
+              "minLength": 1
+            },
+            "propertyNames": {
+              "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+            }
+          },
+          "skip": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Why this check is switched off. A run with one cannot report completion."
+          },
+          "parallel": {
+            "type": "boolean",
+            "description": "Run alongside the adjacent checks also marked parallel. They must not depend on each other."
+          }
+        }
+      }
+    }
+  },
+  "$comment": "verbs: run, http, file, env, browser; browser step verbs: visit, fill, click, expect_text, expect_request, expect_url, wait"
+}

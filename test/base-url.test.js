@@ -28,13 +28,13 @@ test('the regression: a relative path with no serve block is a contract error', 
     checks: [{ name: 'api works', http: { path: '/api/thing', expect: { status: 200 } } }],
   })
   assert.equal(p.length, 1)
-  assert.match(p[0], /http › path: relative, but the spec has no `serve.ready_url`/)
-  assert.match(p[0], /add a serve block, a browser.base_url, or use an absolute URL/)
+  assert.match(p[0], /http › path: relative, and nothing in the contract says what to resolve it against/)
+  assert.match(p[0], /add a serve block with a `ready_url`, a `browser.base_url`, or use an absolute URL/)
 })
 
 test('proof check refuses to run such a contract instead of hitting a stray local server', async () => {
   sandbox({ goal: 'no serve', checks: [{ name: 'api', http: { path: '/api/thing', expect: { status: 200 } } }] })
-  await assert.rejects(() => check({ json: true }), /no `serve.ready_url`/)
+  await assert.rejects(() => check({ json: true }), /nothing in the contract says what to resolve it against/)
 })
 
 test('a relative browser visit with no base is caught the same way', () => {
@@ -43,7 +43,7 @@ test('a relative browser visit with no base is caught the same way', () => {
     checks: [{ name: 'flow', browser: { visit: '/login', flow: [{ click: 'Go' }] } }],
   })
   assert.equal(p.length, 1)
-  assert.match(p[0], /browser › visit: relative, but the spec has no `serve.ready_url`/)
+  assert.match(p[0], /browser › visit: relative, and nothing in the contract says what to resolve it against/)
 })
 
 test('an absolute url, a browser base_url, or a serve block each satisfy it', () => {

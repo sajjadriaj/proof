@@ -38,6 +38,72 @@ A boolean is not enough for an autonomous agent. The failure names the route, th
 what was expected, what was observed, and the console error that explains it — which is the
 context the next iteration needs.
 
+## Claude Code
+
+Claude Code has a place for exactly the decision this tool makes: a **Stop hook** runs when
+the agent believes it is finished, and can refuse to let it stop. One command installs proof
+there:
+
+```bash
+proof hook --install
+```
+
+That writes a `Stop` entry into `.claude/settings.json` — merged into whatever is already
+there, never overwriting it — and from then on every time Claude Code thinks it is done, the
+contract runs. A pass lets it stop. A failure sends the evidence back as its next instruction
+and keeps it working:
+
+```
+proof check: NOT DONE (attempt 1 of 5) — 1 check(s) failed: the profile page shows the user.
+
+# Verification failed (attempt 1)
+
+Requirement: users can log in and see their profile
+...
+```
+
+The budget is the override, as `--max-attempts` is for `guard`: after five refusals (or
+`--max-attempts N`) the agent may stop, with the evidence in `.proof/feedback.md` and the
+reason on stderr. The counter resets on a pass and after the budget is spent, so no session
+inherits another's refusals.
+
+Three things make it safe to leave installed everywhere:
+
+- **No contract, no opinion.** In a directory with no `.proof/spec.yaml` the hook exits
+  silently, so it can live in your global `~/.claude/settings.json`.
+- **A contract that can never complete does not hold the agent hostage.** A broken contract, a
+  placeholder, or a skipped check lets the stop through with the reason on stderr — those are
+  the human's to fix, and blocking every stop over them would burn the budget for nothing the
+  agent did.
+- **The hook's timeout is 900 seconds**, not Claude Code's 60-second default. A contract that
+  boots an app and drives a browser is routinely longer than a minute, and a hook killed
+  mid-run lets the agent stop with no verdict at all.
+
+`proof hook --print` shows the snippet instead of installing it, for a settings file you
+manage by hand or another tool that reads the same shape.
+
+### Teaching an agent to write the contract
+
+The hook enforces a contract. Something still has to write one, and an agent writing it *after*
+the code shapes the checks around whatever it happened to build — the self-judging this whole
+tool exists to remove.
+
+`skills/proof/SKILL.md` in this repository is a Claude Code skill that fixes the order. Copy it
+in:
+
+```bash
+mkdir -p .claude/skills/proof && cp /path/to/proof/skills/proof/SKILL.md .claude/skills/proof/
+```
+
+It tells the agent to write the contract from the requirement **before reading the
+implementation**, read it back with `proof lint`, and confirm with `proof falsify` that it fails
+without the change — refusing to continue on `DOES NOT DISCRIMINATE`. Then implement, then
+`proof check`. Red before green, for acceptance criteria, enforced rather than remembered.
+
+It also carries the rules that decide whether a contract means anything: assert content rather
+than a status, never hardcode an id, quarantine with `skip:` instead of deleting, and never edit
+the contract to make a failing check pass.
+
 ## `proof guard`
 
 The completion gate: instead of the agent deciding when it is finished, the contract decides.
@@ -66,5 +132,6 @@ the loop rather than iterating against it. The feedback file is deleted on succe
 evidence never sits beside a green verdict. Everything after `--` belongs to the agent
 verbatim; proof never parses its flags.
 
-Guard runs `proof check --json` as a subprocess — it is exactly the generic agent loop from
+`guard` is for every agent that is not Claude Code — or for running Claude Code non-interactively
+from CI — since it needs nothing from the agent but an exit. Guard runs `proof check --json` as a subprocess — it is exactly the generic agent loop from
 the Agent Integration section, on the same interface every other agent uses.

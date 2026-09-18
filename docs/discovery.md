@@ -28,6 +28,24 @@ A file whose name is a framework convention is identified by its directory inste
 requesting `/api/users` counts as naming the file that serves it, since every app-router file
 is called `route.ts` and the filename says nothing about which route it is.
 
+Text matching alone had a hole worth naming: a helper module behind a covered route matched
+nothing, so every one of them read as `no check names this file` forever. The import graph is
+already built for the blast radius, so it is also read the other way — from what a check names
+to what that file pulls in:
+
+```
+Checks naming these files:
+  OK    src/app/api/orders/route.ts — an order is accepted
+  VIA   src/lib/pricing.ts — imported by src/app/api/orders/route.ts, which a check names
+  WARN  src/lib/audit.ts — no check names this file
+```
+
+`VIA` is reported apart from `OK`, never folded into it, and it is the weaker claim: the
+check runs that code, which is not the same as asserting anything about what it does. It
+follows `--depth` hops, the same bound the rest of the command uses — claiming a check covers
+everything transitively behind it would be over-claiming, and over-claiming hides a gap.
+`--json` carries these as `reached`, as `{file, via}`.
+
 Test and fixture files are listed as `TEST` rather than `WARN` and left out of the count —
 the file is the verification, and warning about it is the noise that teaches people to skip
 this section. A check that does name one explicitly still reports `OK`.

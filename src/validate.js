@@ -1,5 +1,6 @@
 import { STEP_VERBS, slug } from './browser.js'
 import { TYPE_TOKENS } from './json-match.js'
+import { NAME_RE, SELECTORS, hasRef, referencedVars, selectorProblem } from './vars.js'
 
 export const VERBS = ['run', 'http', 'file', 'env', 'browser']
 
@@ -79,9 +80,9 @@ export const isPlaceholderCommand = value => PLACEHOLDER_RUN.has(String(value).t
 export const ALLOWED = {
   '': ['goal', 'requirement', 'serve', 'checks'],
   serve: ['name', 'run', 'ready_url', 'ready_log', 'url', 'timeout', 'log_must_not_match', 'reuse_existing'],
-  check: ['name', 'timeout', ...VERBS, 'expect_exit', 'expect_output'],
-  'check.http': ['method', 'path', 'url', 'headers', 'body', 'expect', 'follow_redirects'],
-  'check.http.expect': ['status', 'body_contains', 'body_not_contains', 'json'],
+  check: ['name', 'timeout', ...VERBS, 'expect_exit', 'expect_output', 'expect_under_ms', 'retry_for_ms', 'results', 'capture', 'skip', 'parallel'],
+  'check.http': ['method', 'path', 'url', 'headers', 'body', 'expect', 'follow_redirects', 'concurrent'],
+  'check.http.expect': ['status', 'statuses', 'headers', 'body_contains', 'body_not_contains', 'json'],
   'check.file': ['path', 'exists', 'contains', 'not_contains'],
   'check.env': ['name', 'matches'],
   'check.browser': ['visit', 'flow', 'base_url', 'expect_no_console_errors'],
@@ -90,7 +91,9 @@ export const ALLOWED = {
 }
 
 // Opaque by design: user-defined names live here, so we must not police their keys.
-const OPAQUE = new Set(['check.http.headers', 'check.http.body', 'check.http.expect.json', 'step.fill'])
+// `capture` is validated by hand — the keys are yours, the values are proof's grammar.
+const OPAQUE = new Set(['check.http.headers', 'check.http.expect.headers', 'check.http.expect.statuses',
+  'check.http.body', 'check.http.expect.json', 'step.fill', 'check.capture'])
 
 const isPlain = v => v !== null && typeof v === 'object' && !Array.isArray(v)
 
@@ -150,10 +153,38 @@ const ABSOLUTE = /^https?:\/\//i
 
 // A relative path with nothing to resolve it against used to fall back to localhost:3000,
 // which quietly verifies the contract against whatever unrelated app is already running.
-const needsBase = (where, problems) => problems.push(
-  `${where}: relative, but the spec has no \`serve.ready_url\` to resolve it against `
-  + '— add a serve block, a browser.base_url, or use an absolute URL',
-)
+/**
+ * Named for the contract in front of the reader, not for the general case.
+ *
+ * A `ready_log` serve block for an HTTP app has a command and a readiness signal and no base,
+ * and the old wording told its author to "add a serve block" — which they had — while never
+ * naming `url:`, the one key that would have fixed it.
+ */
+const needsBaseMessage = (where, hasServe) =>
+  `${where}: relative, and nothing in the contract says what to resolve it against — `
+  + (hasServe
+    ? 'the serve block declares readiness by log, which is not an address. Add `url:` beside'
+      + ' `ready_log` to say where the app listens'
+    : 'add a serve block with a `ready_url`, a `browser.base_url`, or use an absolute URL')
+
+/**
+ * One mistake, one problem — even when it lands on twenty checks.
+ *
+ * There is a single cause here: the contract has no base URL. Reporting it once per check
+ * buried everything else under twenty copies of the same sentence, and a list that long is one
+ * nobody reads to the end. The first is named so the reader can see the shape of it.
+ */
+const fillNeedsBase = (missing, hasServe, problems) => {
+  if (!missing.length) return
+  if (missing.length === 1) return problems.push(needsBaseMessage(missing[0], hasServe))
+  problems.push(`${missing.length} checks use a relative path or visit, and nothing in the contract says`
+    + ' what to resolve them against — '
+    + (hasServe
+      ? 'the serve block declares readiness by log, which is not an address. Add `url:` beside'
+        + ' `ready_log` to say where the app listens'
+      : 'add a serve block with a `ready_url`, a `browser.base_url`, or use absolute URLs')
+    + `\n    first: ${missing[0]}`)
+}
 
 // `contains: 0` is a number in YAML, and a number is falsy — the assertion would be
 // written but never run. Type-check the values that carry assertions.
@@ -204,6 +235,9 @@ function mustBeRequestable(value, where, problems) {
 
 function mustParse(value, where, problems) {
   if (typeof value !== 'string' || !ABSOLUTE.test(value)) return
+  // A URL still holding `${id}` is not the URL that will be requested — `:${port}` alone makes
+  // it unparseable — and the reference check has already proved the value will be there.
+  if (hasRef(value)) return
   try {
     void new URL(value)
   } catch {
@@ -393,6 +427,13 @@ export function validateSpec(spec) {
             mustParse(value, `${at} › ${key}`, problems)
           }
         }
+        // Nothing has run yet, so nothing can have captured anything. A reference here could
+        // only ever resolve to the literal text.
+        for (const [key, value] of Object.entries(s)) {
+          if (!hasRef(value)) continue
+          problems.push(`${at} › ${key}: uses \${...}, and a serve block starts before any check runs`
+            + ' — there is nothing captured yet for it to resolve to')
+        }
         if (isPlaceholderCommand(s.run)) {
           problems.push(
             `${at} › run: this is still the placeholder proof scaffolded — `
@@ -425,6 +466,10 @@ export function validateSpec(spec) {
   }
 
   const baseUrl = serveBase(serveList(spec))
+  // Whether there is a serve block at all changes what the advice should be.
+  const hasServe = serveList(spec).length > 0
+  // Collected rather than pushed: they all have one cause, and it is said once below.
+  const needsBase = []
 
   // Names key the results map, the evidence filenames, and `--only`. Two checks sharing
   // one means the later result silently replaces the earlier — a failed check can be
@@ -465,12 +510,52 @@ export function validateSpec(spec) {
     const [verb] = used
     mustBe(c.timeout, 'number', `${where} › timeout`, problems)
     mustBePositive(c.timeout, `${where} › timeout`, problems)
+    mustBe(c.expect_under_ms, 'number', `${where} › expect_under_ms`, problems)
+    mustBePositive(c.expect_under_ms, `${where} › expect_under_ms`, problems)
+    mustBe(c.retry_for_ms, 'number', `${where} › retry_for_ms`, problems)
+    mustBePositive(c.retry_for_ms, `${where} › retry_for_ms`, problems)
+    // One says take as long as you need, the other says be quick. A check cannot mean both,
+    // and whichever proof honoured would make the other a written assertion that never ran.
+    if (c.retry_for_ms !== undefined && c.expect_under_ms !== undefined) {
+      problems.push(`${where}: \`retry_for_ms\` and \`expect_under_ms\` contradict each other — one waits`
+        + ' for the app to catch up, the other fails it for being slow. Keep whichever this check means.')
+    }
+    mustBe(c.parallel, 'boolean', `${where} › parallel`, problems)
+    // A skip with no reason is how quarantined checks become permanent: nothing in the file
+    // says what would have to be true to switch it back on.
+    if (c.skip !== undefined && !(typeof c.skip === 'string' && c.skip.trim())) {
+      problems.push(`${where} › skip: must be the reason it is skipped — a skip with no reason is one`
+        + ' nobody can ever decide to remove')
+    }
+    // Parallel checks run together, so nothing can read what one of them captured.
+    if (c.parallel === true && isPlain(c.capture)) {
+      problems.push(`${where}: \`parallel\` and \`capture\` cannot both hold — a check running`
+        + ' alongside others has no defined place in the order for its value to become available')
+    }
+    validateCapture(c.capture, verb, where, problems)
 
     if (verb === 'run' && typeof c.run !== 'string') problems.push(`${where} › run: must be a shell command string`)
     if (verb === 'run') {
       mustBe(c.expect_output, 'string', `${where} › expect_output`, problems)
       mustAssertSomething(c.expect_output, `${where} › expect_output`, problems)
       mustBe(c.expect_exit, 'number', `${where} › expect_exit`, problems)
+      mustBe(c.results, 'string', `${where} › results`, problems)
+      mustAssertSomething(c.results, `${where} › results`, problems)
+    } else {
+      // Only `run` has an exit code and program output, and only `run` reads these. Written
+      // on any other verb they are an assertion the runner never evaluates — the check
+      // reports PASS having tested one clause fewer than its author wrote.
+      const instead = {
+        http: ' Assert on the response under `http › expect`.',
+        file: ' Assert on the file with `file › contains`.',
+        env: ' Assert on the value with `env › matches`.',
+        browser: ' Assert on the page with an `expect_text` or `expect_request` step.',
+      }[verb] ?? ''
+      for (const key of ['expect_exit', 'expect_output', 'results']) {
+        if (c[key] === undefined) continue
+        problems.push(`${where} › ${key}: only a \`run:\` check runs a command, so this is never`
+          + ` read on a \`${verb}\` check.${instead}`)
+      }
     }
     if (verb === 'http' && isPlain(c.http?.expect)) {
       mustBe(c.http.expect.status, 'number', `${where} › http › expect › status`, problems)
@@ -478,6 +563,11 @@ export function validateSpec(spec) {
       mustAssertSomething(c.http.expect.body_contains, `${where} › http › expect › body_contains`, problems)
       mustBe(c.http.expect.body_not_contains, 'string', `${where} › http › expect › body_not_contains`, problems)
       mustAssertSomething(c.http.expect.body_not_contains, `${where} › http › expect › body_not_contains`, problems)
+    }
+    // A number or a list where a path or a mapping belongs reaches the runner as neither, and
+    // it fails there with `file.path missing` — a contract mistake diagnosed as a code failure.
+    if (verb === 'file' && c.file !== undefined && typeof c.file !== 'string' && !isPlain(c.file)) {
+      problems.push(`${where} › file: must be a path, or a mapping with a \`path\``)
     }
     if (verb === 'file' && isPlain(c.file)) {
       mustBe(c.file.path, 'string', `${where} › file › path`, problems)
@@ -511,6 +601,29 @@ export function validateSpec(spec) {
       )
     }
     if (verb === 'http' && isPlain(c.http)) {
+      // `expect: 200` is the shorthand everyone tries. The runner reads `expect.status` off it,
+      // finds nothing, and the check silently degrades to "any status below 400" — the whole
+      // assertion gone, written out in the contract for a reader to trust.
+      if (c.http.expect !== undefined && !isPlain(c.http.expect)) {
+        problems.push(`${where} › http › expect: must be a mapping of assertions`
+          + ' — `expect: {status: 200}`, not a bare value')
+      }
+      // Opaque by design (header names are yours), so nothing else type-checks it: a string
+      // here spreads into `{0: "a", 1: "p", …}` and sends headers nobody wrote.
+      if (c.http.headers !== undefined && !isPlain(c.http.headers)) {
+        problems.push(`${where} › http › headers: must be a mapping of header names to values`)
+      }
+      const want = isPlain(c.http.expect) ? c.http.expect.headers : undefined
+      if (want !== undefined && !isPlain(want)) {
+        problems.push(`${where} › http › expect › headers: must be a mapping of header name to the text it must contain`)
+      } else if (isPlain(want)) {
+        for (const [name, value] of Object.entries(want)) {
+          const at = `${where} › http › expect › headers › ${name}`
+          if (typeof value !== 'string') problems.push(`${at}: must be a string — quote it in YAML`)
+          else mustAssertSomething(value, at, problems)
+        }
+      }
+      validateConcurrent(c, where, problems)
       mustBe(c.http.follow_redirects, 'boolean', `${where} › http › follow_redirects`, problems)
       if (c.http.url !== undefined && !ABSOLUTE.test(c.http.url)) {
         problems.push(`${where} › http › url: must be absolute (http:// or https://) — use \`path\` for a relative one`)
@@ -519,7 +632,7 @@ export function validateSpec(spec) {
         mustParse(c.http.url, `${where} › http › url`, problems)
       }
       mustBeRequestable(c.http.path, `${where} › http › path`, problems)
-      if (c.http.path !== undefined && c.http.url === undefined && !baseUrl) needsBase(where + ' › http › path', problems)
+      if (c.http.path !== undefined && c.http.url === undefined && !baseUrl) needsBase.push(`${where} › http › path`)
     }
     if (verb === 'http' && isPlain(c.http?.expect) && c.http.expect.json !== undefined) {
       badTypeTokens(c.http.expect.json, `${where} › http › expect › json`, problems)
@@ -532,13 +645,158 @@ export function validateSpec(spec) {
       badRegex(c.env?.matches, `${where} › env › matches`, problems)
       mustAssertSomething(c.env?.matches, `${where} › env › matches`, problems)
     }
-    if (verb === 'browser') validateBrowser(c.browser, where, problems, baseUrl)
+    if (verb === 'browser') validateBrowser(c.browser, where, problems, baseUrl, needsBase)
   })
+
+  fillNeedsBase(needsBase, hasServe, problems)
+  validateReferences(spec.checks, problems)
 
   return problems
 }
 
-function validateBrowser(b, where, problems, baseUrl) {
+/**
+ * The upper bound on how many requests one check fires at once.
+ *
+ * A race needs a handful, not a flood: a contract that opened a thousand connections would be
+ * measuring your dev server's accept queue rather than your locking, and doing it from a file
+ * someone wrote expecting a test.
+ */
+export const MAX_CONCURRENT = 50
+
+/**
+ * `concurrent` asks one question — when N of these arrive at once, what comes back? — and
+ * `expect.statuses` is the only answer shape that question has.
+ *
+ * The other `expect` keys are refused alongside it rather than quietly applied to one of the
+ * responses or to all of them: either reading would be a guess, and a guess here is an
+ * assertion the author did not write.
+ */
+function validateConcurrent(c, where, problems) {
+  const http = c.http
+  const n = http.concurrent
+  const want = isPlain(http.expect) ? http.expect : {}
+  const at = `${where} › http › concurrent`
+
+  if (n !== undefined) {
+    mustBe(n, 'number', at, problems)
+    if (typeof n === 'number' && (!Number.isInteger(n) || n < 2)) {
+      problems.push(`${at}: must be a whole number of 2 or more — one request is not a race`)
+    } else if (typeof n === 'number' && n > MAX_CONCURRENT) {
+      problems.push(`${at}: at most ${MAX_CONCURRENT} — past that a check measures the accept queue rather than the app`)
+    }
+    // `capture` has no answer here: there is no "the" response to read a value from.
+    if (isPlain(c.capture)) {
+      problems.push(`${where}: \`concurrent\` and \`capture\` cannot both hold — with several responses`
+        + ' at once there is no single one to capture from')
+    }
+  }
+
+  if (want.statuses !== undefined && n === undefined) {
+    problems.push(`${where} › http › expect › statuses: counts how many of several simultaneous requests`
+      + ' got each status, so it needs `concurrent: <n>` — for one request use `status`')
+  }
+  if (n !== undefined && want.statuses === undefined) {
+    problems.push(`${where} › http › expect › statuses: needed with \`concurrent\` — say how many of the`
+      + ' requests should get each status, like `statuses: {201: 1, 409: 4}`')
+  }
+  if (n !== undefined) {
+    for (const key of ['status', 'body_contains', 'body_not_contains', 'json', 'headers']) {
+      if (want[key] === undefined) continue
+      problems.push(`${where} › http › expect › ${key}: cannot be asserted alongside \`concurrent\` —`
+        + ' there are several responses, and proof will not guess which one you meant. Assert the'
+        + ' outcome with `statuses`, and what the winner produced in a check after it.')
+    }
+  }
+
+  if (!isPlain(want.statuses)) {
+    if (want.statuses !== undefined) {
+      problems.push(`${where} › http › expect › statuses: must be a mapping of status to how many requests got it`)
+    }
+    return
+  }
+
+  let total = 0
+  for (const [code, count] of Object.entries(want.statuses)) {
+    const row = `${where} › http › expect › statuses › ${code}`
+    if (!/^[1-5]\d\d$/.test(code)) problems.push(`${row}: not an HTTP status code`)
+    if (!Number.isInteger(count) || count < 0) {
+      problems.push(`${row}: must be how many requests got that status, as a whole number`)
+      return
+    }
+    total += count
+  }
+  // The tally has to account for every request, or the check is silent about the rest — and
+  // the ones it says nothing about are exactly where a broken lock shows up.
+  if (typeof n === 'number' && Number.isInteger(n) && total !== n) {
+    problems.push(`${where} › http › expect › statuses: accounts for ${total} request(s) but ${n} are sent`
+      + ' — every one has to be counted, or the check says nothing about the rest')
+  }
+}
+
+/** Selectors that need a response rather than a program's output. */
+const RESPONSE_ONLY = ['header.', 'status']
+
+function validateCapture(capture, verb, where, problems) {
+  if (capture === undefined) return
+  if (!isPlain(capture)) {
+    return problems.push(`${where} › capture: must be a mapping of name to selector`
+      + ` — \`capture: {order_id: json.id}\`. Selectors: ${SELECTORS.join(', ')}`)
+  }
+  if (verb === 'browser' || verb === 'env') {
+    return problems.push(`${where} › capture: a \`${verb}\` check has no response to capture from`
+      + ' — capture from an `http` or a `run` check')
+  }
+
+  for (const [name, selector] of Object.entries(capture)) {
+    const at = `${where} › capture › ${name}`
+    // The name becomes `${name}` in a later check, so it has to be spellable as one.
+    if (!NAME_RE.test(name)) {
+      problems.push(`${at}: not a usable variable name — letters, digits and underscores, not starting with a digit`)
+    }
+    const problem = selectorProblem(selector)
+    if (problem) {
+      problems.push(`${at}: ${problem}`)
+      continue
+    }
+    if (verb !== 'http' && RESPONSE_ONLY.some(p => String(selector).startsWith(p))) {
+      problems.push(`${at}: \`${selector}\` reads a response, and a \`${verb}\` check has none`
+        + ' — use `output` or `match:<regex>`')
+    }
+  }
+}
+
+/**
+ * A `${name}` no earlier check produces.
+ *
+ * Checked here rather than at run time because it is a typo, not a failure: a contract
+ * requesting `/orders/${order_ids}` would otherwise boot the app, run everything before it,
+ * and report a check failure for a misspelling proof could see in the file.
+ */
+function validateReferences(checks, problems) {
+  const available = new Set()
+  checks.forEach((c, i) => {
+    if (!isPlain(c)) return
+    const where = `check[${i}]${c?.name ? ` "${c.name}"` : ''}`
+    // `run` is shell, and `${HOME}` is the shell's syntax, not proof's. Policing it here would
+    // reject an ordinary command for using the language it is written in — the same reason
+    // `guard` does not parse the agent's flags. A captured name is still substituted there;
+    // every other one is left for the shell.
+    const { run, ...rest } = c
+    for (const name of referencedVars(rest)) {
+      if (available.has(name)) continue
+      const produced = checks.findIndex(other => isPlain(other?.capture) && name in other.capture)
+      problems.push(produced > i
+        ? `${where}: uses \${${name}}, which check[${produced}] captures — a value can only be used after`
+          + ' the check that produces it. Move this check after that one.'
+        : `${where}: uses \${${name}}, which no check captures — add \`capture: {${name}: <selector>}\``
+          + ' to the check that produces it.')
+    }
+    // Available to everything after it, whether or not this check's own body used one.
+    if (isPlain(c?.capture)) for (const name of Object.keys(c.capture)) available.add(name)
+  })
+}
+
+function validateBrowser(b, where, problems, baseUrl, needsBase) {
   if (!isPlain(b)) return problems.push(`${where} › browser: must be a mapping`)
   // No walk() here: the check-level walk already recurses into `check.browser`, and calling
   // it again reported every unknown key twice — a reader counts two problems and looks for
@@ -554,7 +812,7 @@ function validateBrowser(b, where, problems, baseUrl) {
 
   if (!b.base_url && !baseUrl) {
     const visits = [b.visit, ...(Array.isArray(b.flow) ? b.flow.map(s => s?.visit) : [])].filter(v => typeof v === 'string')
-    if (visits.some(v => !ABSOLUTE.test(v))) needsBase(`${where} › browser › visit`, problems)
+    if (visits.some(v => !ABSOLUTE.test(v))) needsBase.push(`${where} › browser › visit`)
   }
 
   if (b.flow !== undefined && !Array.isArray(b.flow)) {
@@ -581,6 +839,12 @@ function validateBrowser(b, where, problems, baseUrl) {
       )
     }
     for (const v of ['visit', 'click', 'expect_text', 'expect_url']) mustBe(s[v], 'string', `${stepWhere} › ${v}`, problems)
+    // Opaque by design (field names are yours), so this is the only place it can be caught.
+    // `fill: "a@b.c"` enumerates the string's characters, and the step goes looking for a
+    // field called "0" — a failure that names nothing in the contract.
+    if (s.fill !== undefined && !isPlain(s.fill)) {
+      problems.push(`${stepWhere} › fill: must be a mapping of field to value, like {email: "a@b.c"}`)
+    }
     mustAssertSomething(s.expect_text, `${stepWhere} › expect_text`, problems)
     // expect_url is compared exactly, so a bare fragment has no meaning it could be given
     if (typeof s.expect_url === 'string' && !s.expect_url.startsWith('/') && !ABSOLUTE.test(s.expect_url)) {

@@ -11,6 +11,13 @@ const git = (...args) => {
 }
 
 export const inRepo = () => git('rev-parse', '--show-toplevel') !== null
+
+/** The repository root, and where inside it this command was run. */
+export const toplevel = () => git('rev-parse', '--show-toplevel')
+export const showPrefix = () => git('rev-parse', '--show-prefix') ?? ''
+
+/** A ref resolved to the commit it names, so a report can say which one it used. */
+export const resolveCommit = ref => git('rev-parse', `${ref}^{commit}`)
 export const head = () => git('rev-parse', 'HEAD')
 export const branch = () => git('rev-parse', '--abbrev-ref', 'HEAD')
 

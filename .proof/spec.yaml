@@ -1,5 +1,12 @@
 # Acceptance contract for proof itself.
 #
+# READ THIS FIRST IF YOU CAME HERE FOR AN EXAMPLE: your contract will look nothing like this
+# one, and you do not want it to. proof is a CLI, so verifying it means building a throwaway
+# project, running the CLI against it and checking the exit code — which is what every `run:`
+# block below is doing behind its wall of shell. An ordinary contract is `http:`, `browser:`
+# and `file:` checks that read like sentences. See README.md, docs/examples.md, or run
+# `proof lint` on any contract to have it read back to you in English.
+#
 # The requirement is the one the tool exists to serve: a verdict has to mean something.
 # So these check the promises an agent depends on — the exit codes, the refusals, and the
 # machine-readable shape — not just that the suite is green.
@@ -233,4 +240,138 @@ checks:
       printf '#!/bin/sh\ntouch marker.txt\n' > "$d/agent.sh" &&
       (cd "$d" && node "$OLDPWD/bin/proof.js" guard --max-attempts 2 -- ./agent.sh > /dev/null 2>&1); b=$?;
       rm -rf "$d"; test $a -eq 1 && test $b -eq 0
+    expect_exit: 0
+
+  # Two ways a run could answer a question nobody asked. `--only ""` selected every check,
+  # because every name contains the empty string — a subset run that made the completion
+  # claim the flag exists to withhold.
+  - name: an empty --only is refused, not read as "every check"
+    run: >-
+      d=$(mktemp -d) && mkdir -p "$d/.proof" &&
+      printf 'goal: g\nchecks:\n  - name: alpha\n    run: "true"\n' > "$d/.proof/spec.yaml" &&
+      out=$(cd "$d" && node "$OLDPWD/bin/proof.js" check --only "" 2>&1); rc=$?; rm -rf "$d";
+      test $rc -eq 2 && ! printf '%s' "$out" | grep -q 'DONE'
+    expect_exit: 0
+
+  # `expect_output` is only read on a `run:` check. Written on any other verb it validated,
+  # ran, and the check reported PASS having evaluated one clause fewer than its author wrote.
+  - name: an assertion the runner would never read is refused
+    run: >-
+      d=$(mktemp -d) && mkdir -p "$d/.proof" &&
+      printf 'goal: g\nchecks:\n  - name: a\n    file: x.txt\n    expect_output: "hi"\n' > "$d/.proof/spec.yaml" &&
+      out=$(cd "$d" && node "$OLDPWD/bin/proof.js" check 2>&1); rc=$?; rm -rf "$d";
+      test $rc -eq 2 && printf '%s' "$out" | grep -q 'never read on a'
+    expect_exit: 0
+
+  # A contract could not say the most ordinary thing there is to say about an API — create it,
+  # then read it back — so every path was a literal and contracts hardcoded a row someone had
+  # seen in their own database once.
+  - name: a value one check produces is used by the next
+    run: >-
+      d=$(mktemp -d) && mkdir -p "$d/.proof" && cd "$d" &&
+      printf 'import http from "node:http"\nlet n=100\nconst kept=new Map()\nhttp.createServer((q,s)=>{\n if(q.method==="POST"){const id=n++;kept.set(String(id),id);s.writeHead(201,{"content-type":"application/json"});return s.end(JSON.stringify({id}))}\n const m=q.url.match(/^\\/orders\\/(\\d+)$/)\n if(m&&kept.has(m[1])){s.writeHead(200,{"content-type":"application/json"});return s.end(JSON.stringify({id:Number(m[1])}))}\n s.writeHead(404);s.end()\n}).listen(8477)\n' > s.mjs &&
+      printf 'goal: g\nserve:\n  run: node s.mjs\n  ready_url: http://127.0.0.1:8477/orders/1\n  timeout: 20\nchecks:\n  - name: create\n    http: {method: POST, path: /orders, expect: {status: 201}}\n    capture: {order_id: json.id}\n  - name: read it back\n    http: {path: "/orders/${order_id}", expect: {status: 200, json: {id: "${order_id}"}}}\n' > .proof/spec.yaml &&
+      node "$OLDPWD/bin/proof.js" check > /dev/null 2>&1; rc=$?; cd /; rm -rf "$d"; exit $rc
+    expect_exit: 0
+
+  # A reference nothing captures is a typo, and answering it by booting the app and running
+  # everything before it would be a failure reported for something proof could see in the file.
+  - name: a reference nothing captures is refused before anything boots
+    run: >-
+      d=$(mktemp -d) && mkdir -p "$d/.proof" &&
+      printf 'goal: g\nserve:\n  run: sleep 30\n  ready_url: http://127.0.0.1:9\nchecks:\n  - name: c\n    http: {path: "/orders/${nope}"}\n' > "$d/.proof/spec.yaml" &&
+      (cd "$d" && node "$OLDPWD/bin/proof.js" check 2>&1); rc=$?; rm -rf "$d"; exit $rc
+    expect_exit: 2
+    expect_output: "which no check captures"
+
+  # Deleting a check an agent cannot satisfy is invisible in the blast radius and the next run
+  # reports DONE. The sanctioned alternative has to cost the completion claim, or it is the
+  # same hole with a nicer name.
+  - name: a skipped check is refused a completion verdict
+    run: >-
+      d=$(mktemp -d) && mkdir -p "$d/.proof" &&
+      printf 'goal: g\nchecks:\n  - name: a\n    run: "true"\n  - name: b\n    run: "true"\n    skip: "see #412"\n' > "$d/.proof/spec.yaml" &&
+      out=$(cd "$d" && node "$OLDPWD/bin/proof.js" check 2>&1); rc=$?; rm -rf "$d";
+      test $rc -eq 0 && printf '%s' "$out" | grep -q 'INCOMPLETE' && ! printf '%s' "$out" | grep -qx '  DONE'
+    expect_exit: 0
+
+  # Every run of this contract is on disk, and the only one ever consulted was the last: a
+  # check that passes four runs in five rendered exactly like one that always passes.
+  - name: a check that does not agree with itself is named on a green run
+    run: >-
+      d=$(mktemp -d) && mkdir -p "$d/.proof" && cd "$d" &&
+      printf 'goal: g\nchecks:\n  - name: coin\n    run: test -f flip\n' > .proof/spec.yaml &&
+      node "$OLDPWD/bin/proof.js" check > /dev/null 2>&1; touch flip &&
+      node "$OLDPWD/bin/proof.js" check > /dev/null 2>&1 &&
+      out=$(node "$OLDPWD/bin/proof.js" check 2>&1); rc=$?; cd /; rm -rf "$d";
+      test $rc -eq 0 && printf '%s' "$out" | grep -q 'has not agreed with itself'
+    expect_exit: 0
+
+  # A verdict that lives only in a terminal is a verdict nobody sees on the pull request.
+  - name: a run renders as junit for ci
+    run: >-
+      d=$(mktemp -d) && mkdir -p "$d/.proof" &&
+      printf 'goal: g\nchecks:\n  - name: a\n    run: "true"\n' > "$d/.proof/spec.yaml" &&
+      (cd "$d" && node "$OLDPWD/bin/proof.js" check > /dev/null 2>&1 &&
+       node "$OLDPWD/bin/proof.js" report --junit); rc=$?; rm -rf "$d"; exit $rc
+    expect_output: '<testcase name="a"'
+
+  # The question underneath every other one here: would this contract have noticed if the
+  # change had never been made? A check that passes on the code from before the diff reports
+  # DONE for a branch that did nothing, and nothing in a green run says so.
+  - name: a contract that passes without the change is refused
+    run: >-
+      d=$(mktemp -d) && cd "$d" && git init -q -b main . &&
+      git config user.email t@t.t && git config user.name t &&
+      echo old > app.txt && mkdir -p .proof &&
+      printf 'goal: g\nchecks:\n  - name: the file is there\n    file: app.txt\n' > .proof/spec.yaml &&
+      git add -A && git commit -qm before > /dev/null &&
+      echo 'new: the feature' > app.txt &&
+      out=$(node "$OLDPWD/bin/proof.js" falsify 2>&1); rc=$?; cd /; rm -rf "$d";
+      test $rc -eq 1 && printf '%s' "$out" | grep -q 'DOES NOT DISCRIMINATE'
+    expect_exit: 0
+
+  # And the other direction, including the refusal that keeps it honest: a contract that fails
+  # on the base only because the base could not run has proved nothing about itself.
+  - name: a contract that needs the change discriminates, and a boot failure does not
+    run: >-
+      d=$(mktemp -d) && cd "$d" && git init -q -b main . &&
+      git config user.email t@t.t && git config user.name t &&
+      echo old > app.txt && mkdir -p .proof &&
+      printf 'goal: g\nchecks:\n  - name: c\n    file: {path: app.txt, contains: "feature"}\n' > .proof/spec.yaml &&
+      git add -A && git commit -qm before > /dev/null &&
+      echo 'new: the feature' > app.txt &&
+      node "$OLDPWD/bin/proof.js" falsify > /dev/null 2>&1; a=$?;
+      printf 'goal: g\nserve:\n  run: exit 1\n  ready_url: http://127.0.0.1:9\n  timeout: 2\nchecks:\n  - name: c\n    http: {path: /, expect: {status: 200}}\n' > .proof/spec.yaml &&
+      node "$OLDPWD/bin/proof.js" falsify > /dev/null 2>&1; b=$?;
+      cd /; rm -rf "$d"; test $a -eq 0 && test $b -eq 2
+    expect_exit: 0
+
+  # `run:` told proof one thing, the exit code, so three failing tests arrived as `exit 1` and
+  # the evidence held less than the terminal it came from. And a runner given a filter that
+  # matches nothing runs nothing and exits 0 — this tool's own subject, arriving through the
+  # check written to catch everything else.
+  - name: a runner's own report is read, and an empty one is not a pass
+    run: >-
+      d=$(mktemp -d) && mkdir -p "$d/.proof" && cd "$d" &&
+      printf '<testsuites><testsuite name="s"><testcase name="a" classname="auth"/><testcase name="b" classname="auth"><failure message="expected 401, got 200"/></testcase></testsuite></testsuites>' > report.xml &&
+      printf 'goal: g\nchecks:\n  - name: suite\n    run: exit 1\n    results: report.xml\n' > .proof/spec.yaml &&
+      out=$(node "$OLDPWD/bin/proof.js" check 2>&1); a=$?;
+      printf '<testsuites><testsuite name="s"></testsuite></testsuites>' > report.xml &&
+      printf 'goal: g\nchecks:\n  - name: suite\n    run: "true"\n    results: report.xml\n' > .proof/spec.yaml &&
+      empty=$(node "$OLDPWD/bin/proof.js" check 2>&1); b=$?; cd /; rm -rf "$d";
+      test $a -eq 1 && test $b -eq 1 &&
+      printf '%s' "$out" | grep -q 'auth . b — expected 401, got 200' &&
+      printf '%s' "$empty" | grep -q 'records 0 tests'
+    expect_exit: 0
+
+  # The contract is the definition of "done", so it has to be something a human can read back.
+  - name: lint reads a contract back without running it
+    run: >-
+      d=$(mktemp -d) && mkdir -p "$d/.proof" &&
+      printf 'goal: g\nserve:\n  run: sleep 30\n  ready_url: http://127.0.0.1:9\nchecks:\n  - name: the profile page shows the user\n    http: {path: /profile, expect: {status: 200, body_contains: "ada"}}\n' > "$d/.proof/spec.yaml" &&
+      out=$(cd "$d" && node "$OLDPWD/bin/proof.js" lint 2>&1); rc=$?;
+      ran=$(test -d "$d/.proof/runs" && echo yes || echo no); rm -rf "$d";
+      test $rc -eq 0 && test "$ran" = no &&
+      printf '%s' "$out" | grep -q 'GET /profile, status 200, body contains "ada"'
     expect_exit: 0

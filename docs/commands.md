@@ -9,14 +9,18 @@
 | `proof init "<requirement>"` | Write an acceptance contract to `.proof/spec.yaml`, seeded from the repo's own build/test commands and its dev script |
 | `proof infer` | Find verification gaps in the current diff; `--write` appends them to the contract |
 | `proof changed` | Blast radius of the diff — reverse import graph plus which checks name each file |
+| `proof lint` | What the contract would prove if every check passed — without booting or running anything |
+| `proof falsify` | Run the contract against the code from **before** your change. It has to fail there, or it is not testing the change |
 | `proof check` | Execute the contract; the only command whose exit code means "done" |
 | `proof report [run]` | Render the evidence for a run (default: the latest); `--list` shows recent runs, `--all` shows every one |
 | `proof help` | The usage text; `--help` and `-h` are the same |
 | `proof --version` | The installed version, read from `package.json` rather than a copy that can drift |
 | `proof guard -- <agent...>` | Supervise a coding agent: run it, run the contract when it exits, and relaunch it with the failure evidence until the contract passes. `--max-attempts N` bounds the loop; Ctrl-C is the other override |
+| `proof hook` | The same gate as a Claude Code Stop hook. `--install` adds it to `.claude/settings.json`; `--print` shows the snippet; run bare, it is the hook |
 
 Flags: `--json` (machine-readable, on every command), `--force` (init), `--write` (infer),
-`--only TEXT` and `--spec PATH` (check), `--list` and `--all` (report), `--depth N` and `--base REF` (changed, infer).
+`--only TEXT`, `--spec PATH` and `--base-url URL` (check), `--list`, `--all` and `--junit`
+(report), `--depth N` and `--base REF` (changed, infer).
 
 `--spec PATH` runs a contract kept somewhere other than `.proof/spec.yaml` — a release
 contract, a contract per environment. It works on every command that touches a contract —
@@ -45,6 +49,174 @@ accepts and suggest the near miss.
 Exit codes: `0` passed, `1` failed, `2` configuration error.
 
 `proof report` exits `1` for a stale run as well as a failed one — results that describe a tree the repository has since moved past are not a green light, and the exit code is the part CI branches on.
+
+### What a contract would prove
+
+`proof lint` reads the contract and says what a passing run would mean, without starting the
+app or running a check:
+
+```
+CONTRACT .proof/spec.yaml
+
+  4 check(s); 2 exercise the running app; 1 assert what it returns; 1 process(es) started by a serve block
+
+NOTE
+  1 check(s) only assert a status (orders endpoint) — a 200 with the wrong body passes them.
+
+STATUS
+  OK — this is what a passing run would prove
+```
+
+It also reads the contract back as what each check asserts:
+
+```
+WHAT IT SAYS
+  ada signs in
+      POST /login, status 200, json matches {"ok":true,"user":"ada","access_token":"<string>"}
+  another user's order is forbidden, not merely missing
+      GET /orders/${order_id}, status 403, json matches {"error":"not yours"}
+```
+
+The contract is the definition of "done", which makes it something a human has to review — and
+a file nobody can read is a file nobody reviews. These are the same strings the run records as
+`asserted`, so what `lint` reads back is exactly what the evidence will claim rather than a
+second description that can drift from it. `--json` carries them as `says`.
+
+It carries the same advisories `check` gives on a pass, plus the per-check list of which
+ones assert only a status. A contract still holding a placeholder is `UNFINISHED` with exit 2,
+exactly as `check` would refuse it. Someone with the file open wants this answer now, not after
+the two-minute run that would otherwise be the first time they heard it.
+
+`--json` carries `says`, `checks`, `runtime_checks`, `content_checks`, `serve`, `advisory`,
+`status_only`, `skipped`, `unfinished` and `status`.
+
+### Reading another runner's results
+
+A `run:` check can name the JUnit report its command wrote, and proof reads it instead of
+guessing from the exit code:
+
+```yaml
+- name: the suite
+  run: npx pytest --junitxml=report.xml
+  results: report.xml
+```
+
+Failures then arrive by test name, a report of zero tests is a failure rather than a pass, and
+the report is attached as evidence. See [the contract reference](contract.md) for the detail.
+
+### Does the contract actually test the change?
+
+Every other command asks whether the code satisfies the contract. `proof falsify` asks the
+question underneath it: **would this contract have noticed if the change had never been made?**
+
+```
+$ proof falsify
+
+FALSIFY
+
+Requirement:
+  users can log in and see their profile
+
+  The contract was run against 8f3a2c1b9e04, the last commit — the code as it was before your
+  change. Every check that carries the requirement has to fail there, or it is not testing it.
+
+CHECKS AGAINST THE BASE
+  it still builds                  PASS  would pass without your change
+  logging in sets a session        FAIL  needs your change
+  the profile page shows the user  FAIL  needs your change
+
+VERDICT
+  DISCRIMINATES
+  2 of 3 check(s) fail without your change, so the contract is about it
+  1 would pass either way (it still builds) — regression guards, not the requirement
+```
+
+It checks the base commit out into a temporary worktree, runs the **current** contract there,
+and reads what happened. Your working tree is never touched — no stash, no checkout, nothing to
+recover if it is interrupted.
+
+The answer is three-valued, because two would be a lie:
+
+| Verdict | Exit | Means |
+| --- | --- | --- |
+| `DISCRIMINATES` | 0 | At least one check fails without the change. The contract is about it |
+| `DOES NOT DISCRIMINATE` | 1 | Every check passes on the old code. This contract would report DONE for a branch that did nothing |
+| `INCONCLUSIVE` | 2 | It failed, but for a reason that says nothing about the change |
+
+`INCONCLUSIVE` is the one that keeps the command honest. A checkout of the base commit that
+will not boot, a runner that crashed, a command that exits 127 because it was not there — each
+of those makes the contract "fail", and reporting that as *discriminates* would be exactly the
+false confidence the rest of this tool refuses to give. Those failures are excluded from the
+evidence and named separately.
+
+Two things are worth knowing about how the base is prepared:
+
+- **`node_modules`, `.venv`, `venv` and `vendor` are linked from your working tree**, not
+  installed for the base commit. Installing them would be more correct and would also take
+  minutes; without them nothing would boot and every run would be inconclusive. The run says so,
+  and it means a change that *is* a dependency change is not measured by this.
+- **`--base main`** measures what the branch changed, from the fork point, exactly as `changed`
+  and `infer` do. The default is `HEAD`, which is right for uncommitted work.
+
+`--json` carries `status`, `commit`, `discriminating`, `regression_guards`, `suspicious`,
+`checks` (with `about_the_change` per row), `linked_dependencies` and `reused_existing`.
+
+This is the acceptance-level version of watching a test go red before you make it green — and
+unlike that, it is mechanical rather than a thing you have to remember to do.
+
+### Verifying something already running
+
+`proof check --base-url https://staging.example.com` points the run at an app proof did not
+start — a preview deployment, staging, a stack someone else brought up.
+
+The `serve` block is not started, so `app boots`, `app still running` and the log gate do not
+run: they are claims about a process proof holds, and it holds nothing here. Three rows
+disappearing silently would look like a contract that never had them, so the run says so:
+
+```
+OBSERVED BUT NOT GATED
+  checks ran against https://staging.example.com, which proof did not start — `app boots`, `app
+  still running` and the log gate were not run, `run:` and `file:` checks still ran here, and an
+  `env:` check reads proof's own environment rather than that deployment's
+```
+
+`run:` and `file:` checks still execute **where you are**, not on the deployment — a build or
+an artifact check means the same thing it always did, and a check that shells into the remote
+host is yours to write. `--json` carries the URL as `against`.
+
+The value must be an absolute `http(s)` URL, refused at load for the same reason
+`serve.ready_url` is: a scheme-less value can never be fetched, and every check would then
+fail blaming the deployment for a typo on the command line.
+
+### Reporting into CI
+
+`proof report --junit` renders a recorded run as JUnit XML on stdout — the one report format
+every CI already annotates a pull request from:
+
+```yaml
+- run: proof check
+- if: always()
+  run: proof report --junit > proof-results.xml
+- if: always()
+  run: proof report >> "$GITHUB_STEP_SUMMARY"    # the markdown report, in the job summary
+```
+
+The caveats travel with it. `INCOMPLETE`, `STALE`, the advisory and every "observed but not
+gated" line are carried as testsuite properties, because a CI report that drops them is the
+one place the claim gets read as stronger than it is. Control characters are stripped, so an
+ANSI escape in a build log cannot make the file unparseable — which a CI reads as "no results"
+rather than as an encoding problem.
+
+The repository also ships a composite action:
+
+```yaml
+- uses: sajjadriaj/proof@main
+  with:
+    base-url: ${{ steps.deploy.outputs.url }}   # optional
+```
+
+It runs the contract, writes the JUnit file, appends the markdown report to the job summary,
+and exits with the verdict's own code.
 
 ### Iterating on one failure
 
@@ -130,13 +302,16 @@ string is a parser nobody should have to write against a tool built for agents.
 | `partial` | True when `--only` selected a subset |
 | `only` | The `--only` text, or `null` |
 | `serve_skipped` | True when a subset selected nothing that needs the app, so the `serve` block was not started |
+| `skipped` | `{check, reason}` for each check switched off with `skip:` in the contract. One of these makes the run `partial` |
+| `flaky` | `{check, failed, of}` for each check whose recent history holds both outcomes for the same assertion |
+| `against` | The URL `--base-url` pointed the run at, or `null` when proof started the app itself |
 | `advisory` | Set when a passing run proves less than it appears to, otherwise `null` |
 | `warnings` | Things observed but not gated: console errors, redirects, a tree that changed mid-run |
 | `contract_checks` | How many checks the contract declares |
 | `selected_checks` | How many `--only` selected |
 | `ran_checks` | How many contract checks actually ran (synthetic `serve` checks excluded) |
 | `checks` | `{name: status}` for everything that ran, including `app boots` and friends |
-| `results` | `{name, kind, asserted, status, observed, ms}` per check, plus `expected` and `output` on a failure, `evidence`, `warnings`, `cookies_set`, `output_clipped`, `body_clipped` where they apply |
+| `results` | `{name, kind, asserted, status, observed, ms}` per check, plus `expected` and `output` on a failure, `evidence`, `warnings`, `cookies_set`, `captured`, `output_clipped`, `body_clipped` where they apply. A `run` check carries `exit_code`; a retried check carries `attempts`; a check whose runner threw carries `crashed`, which is how a caller tells a failure about the code from one that never reached it. `status` is `passed`, `failed` or `skipped` |
 | `failures` | `{check, expected, observed, output, evidence, was, since}` for each failure. `was` is that check's status in the most recent finished run before this one — `passed`, `failed`, `changed` if a check of that name ran but asserted something else, or `null` if it did not run there. `since` is that run's id |
 
 `proof report --json` returns the same object plus `stale`, and keeps each result's full
@@ -230,10 +405,11 @@ the suite now says.
 | `dependencies` | `{name, from, to, manifest}` per declared version that moved; `null` for added or removed |
 | `unscannable` | Changed files whose imports could not be read, so their dependents are missing |
 | `dependents` | One array per hop: direct importers first, then importers of those |
-| `uncovered` | Application files in the blast radius that no check names; tests and fixtures are excluded |
+| `uncovered` | Application files in the blast radius that no check names and none reaches; tests and fixtures are excluded |
+| `reached` | `{file, via}` for a file nothing names directly but that a file a check does name imports |
 | `tests_changed` | Existing test files this diff edits or removes; added ones are not counted |
 | `contract_changed` | `{removed, added, modified, goal}` — how this diff alters the contract; `null` outside a repository |
-| `coverage` | `{file, checks}` — which check names point at each file in the radius |
+| `coverage` | `{file, checks}` — which check names point at each file in the radius, plus `via` when it was reached through one of them rather than named |
 | `spec` | Whether a contract was found; coverage is `null` without one |
 | `spec_invalid` | The first problem with the contract, when it exists but does not validate; `null` otherwise |
 | `warnings` | Anything that made the scan less complete than it looks |

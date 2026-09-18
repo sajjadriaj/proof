@@ -63,13 +63,15 @@ export const missingRunFields = r =>
  * `specPath` restricts the search to runs of the same contract; without it any contract's
  * run can be the baseline.
  */
-export function previousResult(specPath = null) {
+export function recentResults(specPath = null, limit = 1) {
   let ids
   try {
     ids = readdirSync(RUNS()).filter(n => /^\d+$/.test(n)).sort((a, b) => Number(a) - Number(b))
-  } catch { return null }
+  } catch { return [] }
 
+  const out = []
   for (const id of ids.reverse()) {
+    if (out.length >= limit) break
     const dir = join(RUNS(), id)
     if (!existsSync(join(dir, 'result.json'))) continue
     try {
@@ -77,8 +79,46 @@ export function previousResult(specPath = null) {
       // Runs from every contract share one directory. A baseline from a different contract
       // makes "passed in run 0001" a claim about something else entirely.
       if (specPath && parsed.spec && parsed.spec !== specPath) continue
-      if (!missingRunFields(parsed).length) return { id, result: parsed }
+      if (!missingRunFields(parsed).length) out.push({ id, result: parsed })
     } catch { /* a half-written run is not the baseline; keep looking back */ }
   }
-  return null
+  return out
 }
+
+export const previousResult = (specPath = null) => recentResults(specPath, 1)[0] ?? null
+
+/** How many recent runs a flake verdict is drawn from. */
+export const FLAKE_WINDOW = 10
+
+export const FLAKY_NOTICE = '{check} has not agreed with itself: it failed {failed} of the last {of}'
+  + ' runs that asserted the same thing, and passed the rest. A check that flakes makes every verdict'
+  + ' it appears in weaker — find the nondeterminism, or make the check wait for what it needs.'
+
+/**
+ * Checks whose history contains both outcomes for the same assertion.
+ *
+ * Drawn from the history *before* this run, never including it: a check that passed ten times
+ * and fails now is a regression, and calling that a flake would excuse the change that caused
+ * it. Only a check that was already disagreeing with itself is one.
+ *
+ * Like-for-like or not at all — the same rule the regression marker follows. A check whose
+ * assertion was edited is a different check, and its earlier outcomes say nothing about it.
+ */
+export function flakiness(history, results) {
+  const out = []
+  for (const r of results) {
+    if (r.kind === 'serve' || !r.asserted) continue
+    let passed = 0
+    let failed = 0
+    for (const { result } of history) {
+      const past = (result.results ?? []).find(p => p?.name === r.name && p?.asserted === r.asserted)
+      if (past?.status === 'passed') passed++
+      else if (past?.status === 'failed') failed++
+    }
+    if (passed > 0 && failed > 0) out.push({ check: r.name, failed, of: passed + failed })
+  }
+  return out
+}
+
+export const fillFlakyNotice = f =>
+  FLAKY_NOTICE.replace('{check}', f.check).replace('{failed}', String(f.failed)).replace('{of}', String(f.of))

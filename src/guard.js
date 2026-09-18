@@ -7,7 +7,7 @@ import { placeholderChecks } from './validate.js'
 import { TERMINAL_WIDTH, wrap } from './terminal.js'
 
 const CLI = fileURLToPath(new URL('../bin/proof.js', import.meta.url))
-const FEEDBACK = join(PROOF_DIR, 'feedback.md')
+export const FEEDBACK = join(PROOF_DIR, 'feedback.md')
 
 /**
  * The completion gate. The agent decides nothing about doneness: it runs, and when it
@@ -36,6 +36,19 @@ export async function guard({ command, maxAttempts = Infinity, specPath, json = 
       new Error(`the contract still holds proof's own placeholder command`
         + ` (${waiting.map(c => c.name ?? `check[${c.i}]`).join(', ')}) — every attempt would be`
         + ' refused. Replace it with the command that proves the requirement, then guard.'),
+      { code: 'EUNFINISHED' })
+  }
+
+  // A skipped check makes every run report `partial`, which guard never accepts as a pass —
+  // the agent would be relaunched forever over a check the contract itself switched off.
+  // Refused here, beside the placeholder, for the same reason: before the first launch.
+  const off = (spec.checks ?? []).filter(c => c?.skip !== undefined)
+  if (off.length) {
+    throw Object.assign(
+      new Error(`${off.length} check(s) are skipped in the contract`
+        + ` (${off.map(c => `${c.name ?? '(unnamed)'}: ${c.skip}`).join('; ')})`
+        + ' — a run cannot report completion while they are, so every attempt would end without a'
+        + ' completion verdict. Switch them back on, or remove them.'),
       { code: 'EUNFINISHED' })
   }
 
@@ -118,12 +131,29 @@ function runAgent(command, { attempt, feedback }) {
   })
 }
 
+// The whole verdict arrives on one pipe, and spawnSync's default buffer is 1 MB. A contract
+// with enough checks to exceed it came back truncated, so JSON.parse failed and a run that
+// PASSED was reported as a broken contract — exit 2, the loop aborted, on a green verdict.
+const VERDICT_BUFFER = 64 * 1024 * 1024
+
 // The CLI, not an in-process call: guard is exactly the generic agent loop the spec draws,
 // and running `proof check --json` keeps it on the same interface every other agent uses.
-function runCheck(specPath) {
+export function runCheck(specPath) {
   const r = spawnSync(process.execPath,
     [CLI, 'check', '--json', ...(specPath ? ['--spec', specPath] : [])],
-    { encoding: 'utf8' })
+    { encoding: 'utf8', maxBuffer: VERDICT_BUFFER })
+
+  // A truncated verdict is not a contract error, and saying so would send someone to edit a
+  // contract that is fine. Name the real limit instead.
+  if (r.error) {
+    return {
+      config: true,
+      error: r.error.code === 'ENOBUFS'
+        ? `the verdict exceeded ${VERDICT_BUFFER / 1024 / 1024} MB, so guard could not read it`
+          + ' — run `proof check` directly, and split the contract if it really is that large'
+        : `could not run \`proof check\`: ${r.error.message}`,
+    }
+  }
 
   let out
   try { out = JSON.parse(r.stdout) } catch {
@@ -136,7 +166,7 @@ function runCheck(specPath) {
 const tail = (text, n) => String(text).split('\n').slice(-n).join('\n')
 
 /** What the next attempt reads first. The same facts `check` printed, kept compact. */
-function renderFeedback(result, attempt) {
+export function renderFeedback(result, attempt) {
   const lines = [
     `# Verification failed (attempt ${attempt})`,
     '',

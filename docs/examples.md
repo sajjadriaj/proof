@@ -56,6 +56,155 @@ Why these checks:
 - The last check re-runs the failure just to assert the error message names the file — an
   error a user can act on is part of the requirement.
 
+## A REST API, end to end
+
+The shape most backend work actually has: sign in, create something, read it back, and prove
+another user cannot. Every id in it is produced by the contract rather than typed into it, so
+it passes on a machine that has never seen your database.
+
+This one is verified — it is the contract `proof` itself was measured against while the `http`
+verb was being filled in.
+
+```yaml
+goal: a signed-in user can place an order and read it back, and cannot read anyone else's
+
+serve:
+  run: node server.mjs
+  ready_log: "api listening"
+  url: http://localhost:8901      # ready_log says WHEN it is up, url says WHERE it is
+
+checks:
+  - name: a wrong password does not create a session
+    http:
+      method: POST
+      path: /login
+      body: {user: ada, password: wrong}
+      expect: {status: 401, json: {error: bad credentials}}
+
+  - name: ada signs in, and the session cookie is safe to hand a browser
+    http:
+      method: POST
+      path: /login
+      body: {user: ada, password: hunter2}
+      expect:
+        status: 200
+        headers: {set-cookie: "HttpOnly"}
+        json: {ok: true, user: ada, access_token: "<string>"}
+    capture:
+      ada_token: json.access_token
+
+  - name: an order without a sku is rejected, and says which field
+    http:
+      method: POST
+      path: /orders
+      body: {qty: 2}
+      expect: {status: 400, json: {error: "sku is required", field: sku}}
+
+  - name: ada places an order, and it reports where the order lives
+    http:
+      method: POST
+      path: /orders
+      body: {sku: ABC-1, qty: 3}
+      expect:
+        status: 201
+        headers: {location: "/orders/"}
+        json: {id: "<number>", sku: ABC-1, qty: 3}
+    capture:
+      order_id: json.id
+      order_url: header.location
+
+  - name: the order reads back at the id it was given
+    http:
+      path: "/orders/${order_id}"
+      expect: {status: 200, json: {id: "${order_id}", sku: ABC-1, qty: 3}}
+
+  - name: and at the Location it reported
+    http:
+      path: "${order_url}"
+      expect: {status: 200, json: {sku: ABC-1}}
+
+  - name: bob signs in too
+    http:
+      method: POST
+      path: /login
+      body: {user: bob, password: pw}
+      expect: {status: 200}
+    capture:
+      bob_token: json.access_token
+
+  - name: another user's order is forbidden, not merely missing
+    http:
+      path: "/orders/${order_id}"
+      headers: {authorization: "Bearer ${bob_token}", cookie: "sid=none"}
+      expect: {status: 403, json: {error: not yours}}
+
+  - name: an unknown order is a 404, not a 500
+    http:
+      path: /orders/999999
+      headers: {authorization: "Bearer ${ada_token}", cookie: "sid=none"}
+      expect: {status: 404}
+
+  - name: ada deletes the order
+    http:
+      method: DELETE
+      path: "/orders/${order_id}"
+      headers: {authorization: "Bearer ${ada_token}", cookie: "sid=none"}
+      expect: {status: 204}
+
+  - name: and afterwards it is gone
+    http:
+      path: "/orders/${order_id}"
+      headers: {authorization: "Bearer ${ada_token}", cookie: "sid=none"}
+      expect: {status: 404, json: {error: not found}}
+```
+
+Five things in there are worth copying:
+
+- **`capture` everywhere an id appears.** `/orders/17` works on the machine where order 17
+  exists. `/orders/${order_id}` works anywhere, because the contract made the order.
+- **Two users, two tokens.** The cookie jar holds one session per origin, so the second user
+  arrives by bearer token with `cookie: "sid=none"` to be sure the session is not what answered.
+- **403 asserted apart from 404.** "Not yours" and "not there" are different bugs, and an
+  authorization check that accepts either is not an authorization check.
+- **The error *shape*, not just the status.** `{error: "sku is required", field: sku}` is what a
+  form binds to; a bare 400 says the request was refused, not that anyone can act on it.
+- **`ready_log` with `url`.** The log says when the app is up; the URL says where it is. An HTTP
+  app that announces itself in its log needs both.
+
+### Work that finishes after the response
+
+```yaml
+  - name: the export is accepted for later
+    http: {method: POST, path: /exports, expect: {status: 202, json: {job_id: "<string>"}}}
+    capture: {job_id: json.job_id}
+
+  - name: and the worker finishes it
+    http: {path: "/exports/${job_id}", expect: {status: 200, json: {state: done}}}
+    retry_for_ms: 30000
+```
+
+### A race, which no sequence of requests can show
+
+```yaml
+  - name: only one of five simultaneous claims on an order wins
+    http:
+      method: POST
+      path: "/orders/${order_id}/claim"
+      concurrent: 5
+      expect:
+        statuses: {201: 1, 409: 4}
+```
+
+Asking twice in a row gives 201 then 409 whether the lock works or not. Asking five times at
+once is the only way to see a check-and-set that straddles an `await`:
+
+```
+Expected:
+  5 at once: 1×201, 4×409
+Observed:
+  5 at once: 5×201
+```
+
 ## A Go API service
 
 Requirement: *"orders can be created and fetched; the service refuses to start without its

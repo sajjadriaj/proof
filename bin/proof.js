@@ -13,15 +13,21 @@ import { changed } from '../src/changed.js'
 import { suggest } from '../src/validate.js'
 import { GLOBAL_FLAGS, COMMAND_FLAGS, VALUE_FLAGS, POSITIONALS } from '../src/cli.js'
 import { infer } from '../src/infer.js'
+import { lint } from '../src/lint.js'
+import { falsify } from '../src/falsify.js'
+import { hook } from '../src/hook.js'
 
 const USAGE = `proof — verification CLI for AI coding agents
 
   proof init "<requirement>"   create an acceptance contract at .proof/spec.yaml
   proof infer                  find verification gaps in the current diff
   proof changed                blast radius of the current diff vs its checks
+  proof lint                   what the contract would prove, without running it
+  proof falsify                run the contract against the code before your change — it must fail
   proof check                  execute the contract
   proof report [run]           render the evidence for a run (default: latest)
   proof guard -- <agent...>    supervise an agent: rerun it until the contract passes
+  proof hook                   Claude Code Stop hook: refuse to finish until the contract passes
   proof help                   this text
   proof --version              the installed version
 
@@ -33,10 +39,14 @@ const USAGE = `proof — verification CLI for AI coding agents
   --prune       delete all but the most recent runs (report)
   --keep <n>    with --prune, how many runs to keep (report; default 20)
   --only TEXT   run only checks whose name contains TEXT (check)
-  --max-attempts N  stop after N agent runs (guard; default: until it passes)
-  --spec PATH   contract path (init/check/changed/infer/guard)
+  --base-url U  verify an app already running at U instead of starting one (check)
+  --junit       render a run as JUnit XML for CI (report)
+  --install     add the Stop hook to .claude/settings.json (hook)
+  --print       show the settings snippet instead of installing it (hook)
+  --max-attempts N  stop after N agent runs (guard: default until it passes; hook: default 5)
+  --spec PATH   contract path (init/check/changed/infer/guard/lint/hook/falsify)
   --depth N     import-graph hops to follow (changed/infer, default 1)
-  --base REF    diff against REF instead of HEAD (changed/infer)
+  --base REF    diff against REF instead of HEAD (changed/infer/falsify)
 
 exit codes: 0 passed, 1 failed, 2 configuration error
 
@@ -84,17 +94,29 @@ function parseArgs() {
         + `\n  ${cmd ? `\`proof ${cmd}\`` : 'this command'} accepts: ${allowed.map(f => `--${f}`).join(', ')}${guardHint}`)
     }
 
-    if (inline !== undefined) { flags[name] = inline; continue }
+    if (inline !== undefined) {
+      if (VALUE_FLAGS.has(name) && inline === '') throw usage(emptyValue(name))
+      flags[name] = inline
+      continue
+    }
     if (!VALUE_FLAGS.has(name)) { flags[name] = true; continue }
 
     const value = argv[++i]
     if (value === undefined || value.startsWith('--')) {
       throw usage(`--${name} needs a value (use --${name}=<value> if it starts with "--")`)
     }
+    if (value === '') throw usage(emptyValue(name))
     flags[name] = value
   }
   return { flags, args }
 }
+
+// An empty value is not a value, and `--only ""` was the expensive case: every check name
+// contains the empty string, so the flag selected the whole contract and the run reported
+// DONE — the completion claim `--only` exists to withhold.
+const emptyValue = name => `--${name} was given an empty value`
+  + `\n  ${name === 'only' ? 'pass the text a check name must contain, or drop the flag to run everything'
+    : 'pass a value, or drop the flag'}`
 
 // How many bare arguments each command takes. A dropped positional is the same silent
 // misreading as a dropped flag: `proof check alpha` ran the entire contract and reported
@@ -138,7 +160,7 @@ try {
       process.exitCode = changed({ json, depth: positiveInt(flags.depth, 'depth', 1), base: flags.base ?? 'HEAD', specPath: flags.spec })
       break
     case 'check':
-      process.exitCode = await check({ json, only: flags.only, specPath: flags.spec })
+      process.exitCode = await check({ json, only: flags.only, specPath: flags.spec, baseUrl: flags['base-url'] })
       break
     case 'guard':
       process.exitCode = await guard({
@@ -148,10 +170,30 @@ try {
         json,
       })
       break
+    case 'lint':
+      process.exitCode = lint({ json, specPath: flags.spec })
+      break
+    case 'falsify':
+      process.exitCode = falsify({ json, specPath: flags.spec, base: flags.base ?? 'HEAD' })
+      break
+    case 'hook':
+      if (flags.install === true && flags.print === true) throw usage('--install and --print are alternatives — pick one')
+      process.exitCode = await hook({
+        install: flags.install === true,
+        print: flags.print === true,
+        maxAttempts: positiveInt(flags['max-attempts'], 'max-attempts', 5),
+        specPath: flags.spec,
+        json,
+      })
+      break
     case 'report':
+      // Same rule as an unknown flag: a flag that does nothing is a silently misread request.
+      // `proof report --keep 5` reads as "prune to five" and rendered the latest report instead.
+      if (flags.keep !== undefined && flags.prune !== true) throw usage('--keep only applies with --prune — `proof report --prune --keep 5`')
+      if (flags.all === true && flags.list !== true) throw usage('--all only applies with --list — `proof report --list --all`')
       process.exitCode = flags.prune === true
         ? prune({ json, keep: positiveInt(flags.keep, 'keep', 20) })
-        : report({ json, run: args[0], list: flags.list === true, all: flags.all === true })
+        : report({ json, run: args[0], list: flags.list === true, all: flags.all === true, junit: flags.junit === true })
       break
     case undefined:
     case '-h':

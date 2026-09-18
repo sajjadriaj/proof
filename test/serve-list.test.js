@@ -264,7 +264,7 @@ test('a relative path with no URL anywhere in the list is still refused', () => 
     serve: [{ name: 'w', run: 'a', ready_log: 'up' }, { name: 'x', run: 'b', ready_log: 'up' }],
     checks: [{ name: 'a', http: { path: '/health' } }],
   })
-  assert.ok(problems.some(p => /no `serve.ready_url` to resolve it against/.test(p)), problems.join('\n'))
+  assert.ok(problems.some(p => /nothing in the contract says what to resolve it against/.test(p)), problems.join('\n'))
 })
 
 test('the generated names are derived in one place', () => {

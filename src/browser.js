@@ -238,7 +238,17 @@ export async function runBrowser(c, ctx) {
   try {
     browser = await chromium.launch()
   } catch (e) { throw browserLaunchError(e) }
-  const page = await (await browser.newContext({ baseURL: base })).newPage()
+
+  // Opening the context or the first page can fail — a browser that crashed or ran out of
+  // memory does exactly that — and the `finally` that closes it only starts further down.
+  // Without this the chromium process ran on for the rest of the proof run, held by nothing.
+  let page
+  try {
+    page = await (await browser.newContext({ baseURL: base })).newPage()
+  } catch (e) {
+    await browser.close().catch(() => {})
+    throw e
+  }
 
   // Correlate each request with what came back. Without this, `expect_request` proves only
   // that the browser tried — a 500 looks identical to a success.
