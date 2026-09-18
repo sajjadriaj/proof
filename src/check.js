@@ -4,11 +4,13 @@ import { mkdirSync, writeFileSync, existsSync, readFileSync, readdirSync, statSy
 import { join } from 'node:path'
 import { loadSpec, PROOF_DIR, SPEC_PATH, writeFileAtomic, writeError, contractChange, CONTRACT_CHANGED_NOTICE } from './spec.js'
 import { placeholderChecks, serveList, serveLabel, serveCheckName, serveBase } from './validate.js'
-import { evidenceGrowth, RUNS, previousResult } from './runs.js'
+import { evidenceGrowth, RUNS, recentResults, FLAKE_WINDOW, flakiness, fillFlakyNotice } from './runs.js'
 import { context as gitContext, fingerprint, inRepo } from './git.js'
 import { testsChanged, fillTestsNotice } from './diff.js'
 import { runBrowser, slug } from './browser.js'
 import { jsonMismatch } from './json-match.js'
+import { substitute, captureValue } from './vars.js'
+import { parseJUnit, describeFailures } from './junit.js'
 import { TERMINAL_WIDTH, padTo, truncateToWidth, wrap, block, columnWidth, ellipsize } from './terminal.js'
 
 export { TERMINAL_WIDTH } from './terminal.js'
@@ -131,6 +133,33 @@ const SETTLE_MS = 300
 // How much of a response body is stored inline; the rest is kept beside a failure.
 const BODY_INLINE_LIMIT = 4000
 
+// How much of one proof will hold at all. `res.text()` buffers whatever the endpoint sends,
+// so a contract pointed at an export or a media route took the run down with it — and a run
+// that dies writes no evidence, which is the worst way for this tool to fail.
+const BODY_LIMIT = 8 * 1024 * 1024
+
+/**
+ * The whole body, or null when it is larger than that.
+ *
+ * Null rather than the part that fitted: every assertion here is about the body, and half of
+ * one is the wrong answer in both directions — `body_contains` misses a match past the cut,
+ * and `body_not_contains` passes over a string sitting in the half never read.
+ */
+async function readBody(res) {
+  if (!res.body) return res.text()
+  const chunks = []
+  let bytes = 0
+  for await (const chunk of res.body) {
+    bytes += chunk.byteLength ?? chunk.length
+    if (bytes > BODY_LIMIT) {
+      await res.body.cancel().catch(() => {})
+      return null
+    }
+    chunks.push(Buffer.from(chunk))
+  }
+  return Buffer.concat(chunks).toString('utf8')
+}
+
 // Named, and with the cause where there is a usual one. "exit null" is not a fact anyone
 // can act on; "killed by SIGKILL" points somewhere, and for SIGKILL the somewhere is almost
 // always the OOM killer or an outer timeout.
@@ -155,6 +184,45 @@ export const describeExit = (code, verb = 'exit') => {
 
 export const describeSignal = signal => `killed by ${signal}${SIGNAL_CAUSE[signal] ?? ''}`
 
+/**
+ * What a runner's own report says, when the check named one.
+ *
+ * Read before the exit code, because the exit code is the less informative half of the same
+ * fact: three failing tests and a `1` say the same thing, and only one of them tells the next
+ * iteration what to fix.
+ */
+function fromReport(c, log) {
+  const path = c.results
+  let source
+  try {
+    source = readFileSync(path, 'utf8')
+  } catch (e) {
+    return fail(`${path} reports the suite`,
+      e.code === 'ENOENT'
+        ? `the command finished but wrote no report at ${path} — check the reporter flag`
+          + ' (`--reporter=junit`, `--junitxml=`) and that it writes where the contract looks'
+        : `${path} could not be read — ${e.message}`,
+      log)
+  }
+
+  const report = parseJUnit(source)
+  if (!report) {
+    return fail(`${path} reports the suite`, `${path} is not a JUnit report — proof reads the`
+      + ' JUnit XML every runner can write, not a runner\'s own format', log)
+  }
+  // A runner given a filter that matches nothing runs nothing and exits 0. That is the whole
+  // class of bug this tool exists for, arriving through the check meant to catch the others.
+  if (report.tests === 0) {
+    return fail(`${path} reports the suite`, 'the report records 0 tests — the command ran nothing,'
+      + ' which is not the same as everything passing', log)
+  }
+  if (report.failed) {
+    return fail(`${report.tests} test(s) pass`,
+      `${report.failed} of ${report.tests} failed:\n${describeFailures(report)}`, log)
+  }
+  return { ...pass(`${report.tests} test(s) passed`, log), report }
+}
+
 async function runShell(c) {
   const timeout = c.timeout ?? 600
   const r = await sh(c.run, timeout)
@@ -162,17 +230,32 @@ async function runShell(c) {
   const log = clip(full)
   const wantExit = c.expect_exit ?? 0
 
+  // The report first where there is one: a suite's own account of itself names the tests, and
+  // the exit code only says that something went wrong. A clean report with a bad exit code is
+  // still a failure — something other than the tests broke — and it is reported as that.
+  const reported = c.results !== undefined && !r.timedOut && !r.signal ? fromReport(c, log) : null
+
   const result = r.timedOut ? fail(`exit ${wantExit}`, `timed out after ${timeout}s`, log)
     : r.signal ? fail(`exit ${wantExit}`, describeSignal(r.signal), log)
-      : r.code !== wantExit ? fail(`exit ${wantExit}`, describeExit(r.code), log)
+      : reported?.status === 'failed' ? reported
+      : r.code !== wantExit
+        ? fail(`exit ${wantExit}`, `${describeExit(r.code)}${reported ? ', though every test in the report passed' : ''}`, log)
       // `!== undefined`, never truthiness: `expect_output: 0` is a written assertion.
       : c.expect_output !== undefined && !full.includes(c.expect_output)
         ? fail(`output contains "${c.expect_output}"`, 'substring not found', log)
-        : pass(`exit ${r.code}`, log)
+        : reported ?? pass(`exit ${r.code}`, log)
+
+  if (c.results !== undefined) result.evidence = [...(result.evidence ?? []), c.results]
+
+  // The number, beside the sentence about it. `observed` is prose proof is free to reword, and
+  // a caller deciding whether a failure is the code or the environment — a missing binary
+  // exits 127 — should not have to parse an English clause to find out.
+  if (r.code !== null && r.code !== undefined) result.exit_code = r.code
 
   // `full` never reaches result.json — it goes to commands.log, so the bundle holds
   // everything the command said, not just the part that fitted.
   result.full = full
+  result.source = { output: full }
   result.output_clipped = log !== full.trim()
   if (r.dropped) result.output_dropped = r.dropped
   return result
@@ -256,6 +339,12 @@ export async function runHttp(c, ctx) {
   // fetch follows redirects by default, so `res.status` is whatever answered LAST. Without
   // tracking that, `/admin` 302-ing to a 200 login page passes a check asserting /admin works.
   const follow = h.follow_redirects !== false
+
+  // A race is the one thing a sequence of requests cannot show. Two clients claiming the same
+  // order, two payments with one idempotency key, two writers on one row: the bug is that both
+  // succeed, and a contract that asks twice in a row never sees it.
+  if (h.concurrent !== undefined) return runConcurrent(c, h, url, method, init, follow)
+
   let res, text
   try {
     res = await fetch(url, {
@@ -263,12 +352,21 @@ export async function runHttp(c, ctx) {
       redirect: follow ? 'follow' : 'manual',
       signal: AbortSignal.timeout((c.timeout ?? 30) * 1000),
     })
-    text = await res.text()
+    text = await readBody(res)
   } catch (e) {
     // Node's fetch reports every connection problem as the same "fetch failed" and puts the
     // real reason in `cause`. Refused, DNS failure and TLS error all read identically without
     // it, and that reason is the whole diagnosis.
     return fail(`${method} ${url} responds`, `request failed: ${describeFetchError(e)}`)
+  }
+
+  if (text === null) {
+    return fail(
+      'a response proof can assert on',
+      `status ${res.status}, but the body passed ${BODY_LIMIT / 1024 / 1024} MB and proof stopped reading it`
+      + ' — asserting on the part that fitted would be an answer about half a response. Stream a payload'
+      + ' this size with a `run:` check and assert on what it wrote with a `file:` check.',
+    )
   }
 
   // Names only — cookie values are credentials, and evidence bundles get shared.
@@ -301,6 +399,24 @@ export async function runHttp(c, ctx) {
     if (want.status !== undefined && res.status !== want.status) {
       return fail(`status ${want.status}`, `status ${res.status}${via}`, body)
     }
+    // Matched as a substring, and the header name case-insensitively. `content-type` carries a
+    // charset, `set-cookie` carries flags, `cache-control` carries a list — asserting any of
+    // those exactly means rewriting the check the first time an unrelated directive is added.
+    for (const [name, mustContain] of Object.entries(want.headers ?? {})) {
+      const key = name.toLowerCase()
+      // Several Set-Cookie headers are several headers, not one comma-joined value: joining
+      // them is how a flag on one cookie reads as a flag on another.
+      const actual = key === 'set-cookie'
+        ? (res.headers.getSetCookie?.() ?? []).join('\n')
+        : res.headers.get(key)
+      if (actual === null || actual === undefined) {
+        return fail(`header ${name} contains "${mustContain}"`, `no ${name} header${via}`, body)
+      }
+      if (!actual.includes(mustContain)) {
+        return fail(`header ${name} contains "${mustContain}"`, `${name} is "${actual}"${via}`, body)
+      }
+    }
+
     if (want.body_contains !== undefined && !text.includes(want.body_contains))
       return fail(`body contains "${want.body_contains}"`, 'substring not found', body)
 
@@ -334,6 +450,9 @@ export async function runHttp(c, ctx) {
   const result = decide()
   result.body_clipped = clipped
   if (cookiesSet.length) result.cookies_set = cookiesSet
+  // What `capture` reads. Never written to the bundle — the whole body is already there when
+  // it matters, and headers carry credentials.
+  result.source = { body: text, status: res.status, headers: res.headers }
 
   // Keep the whole body when the check failed — that is when someone reads it. Writing
   // megabytes beside every passing check would be storage for nobody.
@@ -351,6 +470,59 @@ export async function runHttp(c, ctx) {
     ]
   }
   return result
+}
+
+/** `1×201, 4×409` — the shape of the answer and of the question, so they compare by eye. */
+const tally = counts => Object.entries(counts)
+  .sort(([a], [b]) => Number(a) - Number(b))
+  .map(([code, n]) => `${n}×${code}`)
+  .join(', ')
+
+/**
+ * The same request, N times, at once.
+ *
+ * Only the statuses are asserted, and all of them: what a race produces is a distribution, and
+ * a check that named one response would be describing whichever happened to be looked at.
+ *
+ * Nothing is written to the cookie jar from here. Several responses may each carry a
+ * `Set-Cookie` and there is no order among them, so keeping one would be picking arbitrarily —
+ * and a session established by a coin flip is worse than no session.
+ */
+async function runConcurrent(c, h, url, method, init, follow) {
+  const n = h.concurrent
+  const want = h.expect?.statuses ?? {}
+  const timeout = (c.timeout ?? 30) * 1000
+
+  const settled = await Promise.all(Array.from({ length: n }, async () => {
+    try {
+      const res = await fetch(url, { ...init, redirect: follow ? 'follow' : 'manual', signal: AbortSignal.timeout(timeout) })
+      // The body is read and dropped: leaving it unread keeps the connection open, and with
+      // every request in flight at once that is how a run wedges rather than finishes.
+      await res.arrayBuffer().catch(() => {})
+      return { status: res.status }
+    } catch (e) {
+      return { error: describeFetchError(e) }
+    }
+  }))
+
+  const got = {}
+  const failures = []
+  for (const r of settled) {
+    if (r.error) failures.push(r.error)
+    else got[r.status] = (got[r.status] ?? 0) + 1
+  }
+
+  const expected = `${n} at once: ${tally(want)}`
+  if (failures.length) {
+    const distinct = [...new Set(failures)]
+    return fail(expected, `${failures.length} of ${n} request(s) never completed: ${distinct.slice(0, 3).join('; ')}`)
+  }
+
+  const same = Object.keys({ ...want, ...got })
+    .every(code => (got[code] ?? 0) === (want[code] ?? 0))
+  return same
+    ? pass(`${n} at once: ${tally(got)}`)
+    : fail(expected, `${n} at once: ${tally(got)}`)
 }
 
 const READ_CHUNK = 1 << 20
@@ -447,6 +619,7 @@ export function describe(c, kind) {
   const q = v => JSON.stringify(String(v))
   if (kind === 'run') {
     const parts = [`\`${c.run}\``, `exit ${c.expect_exit ?? 0}`]
+    if (c.results !== undefined) parts.push(`every test in ${c.results} passes`)
     if (c.expect_output !== undefined) parts.push(`output contains ${q(c.expect_output)}`)
     return parts.join(', ')
   }
@@ -468,7 +641,12 @@ export function describe(c, kind) {
     const parts = [`${(h.method ?? 'GET').toUpperCase()} ${h.url ?? h.path ?? '/'}`]
     const w = h.expect ?? {}
     // Mirrors runHttp: with no `expect`, the assertion is still "not an error status".
+    if (h.concurrent !== undefined) {
+      const counts = Object.entries(w.statuses ?? {}).sort(([a], [b]) => Number(a) - Number(b))
+      return `${h.concurrent} at once: ${parts[0]}, ${counts.map(([code, n]) => `${n}×${code}`).join(', ')}`
+    }
     parts.push(w.status !== undefined ? `status ${w.status}` : 'a non-error status')
+    for (const [name, value] of Object.entries(w.headers ?? {})) parts.push(`header ${name} contains ${q(value)}`)
     if (w.body_contains !== undefined) parts.push(`body contains ${q(w.body_contains)}`)
     if (w.body_not_contains !== undefined) parts.push(`body does not contain ${q(w.body_not_contains)}`)
     if (w.json !== undefined) parts.push(`json matches ${JSON.stringify(w.json)}`)
@@ -544,6 +722,37 @@ export const comparableStatus = (previous, asserted) => {
   if (previous.asserted !== null && asserted !== undefined && previous.asserted !== asserted) return 'changed'
   return previous.status
 }
+
+/**
+ * What a contract would prove if every check passed — decided from the file alone, so `lint`
+ * can say it before a run and `check` can say it after one. `appStarted` is the only fact
+ * that needs a run: whether a serve block was actually brought up.
+ */
+export function contractAdvisory(spec, { appStarted }) {
+  // The product's whole premise: a green test suite is not the same as a satisfied
+  // requirement. A contract made only of `run:` commands proves exactly the thing
+  // the tool exists to distrust, so say so — on a pass, where the false confidence is.
+  const acceptance = spec.checks.some(c => 'http' in c || 'browser' in c || 'env' in c)
+
+  // A status code says the app answered, not what it answered with. `infer` can only
+  // generate `expect: {status: 200}` — it cannot know the requirement — so a contract built
+  // from generated checks passes on a 200 carrying exactly the wrong body.
+  const responseChecks = spec.checks.filter(c => 'http' in c || 'browser' in c)
+
+  // Three different gaps, narrowing. Saying "nothing exercises the running application"
+  // when `app boots` just passed is false: the app was started and answered. What is
+  // missing there is narrower, and naming it precisely is the difference between advice
+  // someone acts on and a caveat they learn to skip.
+  return !acceptance && appStarted ? ADVISORY.liveness_only
+    : !acceptance ? ADVISORY.no_runtime
+      : responseChecks.length && !responseChecks.some(assertsContent) ? ADVISORY.status_only
+        : null
+}
+
+/** Whether a check says anything about what the app returned, rather than that it answered. */
+export const assertsContent = c =>
+  Boolean((c.http && (c.http.expect?.body_contains !== undefined || c.http.expect?.json !== undefined))
+    || (c.browser && (c.browser.flow ?? []).some(s => s?.expect_text !== undefined || s?.expect_request !== undefined)))
 
 export const ADVISORY = {
   no_runtime:
@@ -844,7 +1053,132 @@ function nextRunDir() {
   throw new Error(`could not allocate a run directory under ${runs}`)
 }
 
-export async function check({ json = false, specPath, only } = {}) {
+const isPlainObject = v => v !== null && typeof v === 'object' && !Array.isArray(v)
+
+// How often a retried check asks again. Fixed rather than backing off: the budget is the
+// contract's, and a backoff would spend most of it asleep near the end.
+const RETRY_INTERVAL_MS = 250
+
+/**
+ * Checks grouped into the units that run together.
+ *
+ * A run of consecutive `parallel: true` checks becomes one batch; everything else is a batch
+ * of one. The batch is a barrier, so a contract's order still means what it meant — a login
+ * before the profile read, a seed before the assertion — and only the checks whose author
+ * said they are independent overlap.
+ */
+export function batchChecks(selected) {
+  const batches = []
+  selected.forEach((check, index) => {
+    const entry = { check, index }
+    const last = batches[batches.length - 1]
+    if (check?.parallel === true && last?.[0]?.check?.parallel === true) last.push(entry)
+    else batches.push([entry])
+  })
+  return batches
+}
+
+/**
+ * One check: its variables filled in, run, and whatever it captures recorded.
+ *
+ * Capture happens only on a pass. A value read off a failed response is a value read off the
+ * wrong thing, and every later check built on it would fail for a reason that is not its own.
+ */
+async function runOne({ check: c, index }, ctx, vars, producedBy) {
+  const kind = Object.keys(RUNNERS).find(k => k in c)
+  if (!kind) throw new Error(`check "${c.name ?? JSON.stringify(c)}" has no known verb (${Object.keys(RUNNERS).join('|')})`)
+  // index-suffixed so unnamed checks cannot collide in the results map either
+  const name = c.name ?? `${kind} check ${index + 1}`
+
+  // Quarantined on purpose. Recorded as a check with a reason rather than removed, and the
+  // run reports INCOMPLETE for it — a contract with a check switched off has not been proved.
+  if (c.skip !== undefined) {
+    return { name, kind, asserted: describe(c, kind), status: 'skipped', observed: c.skip, ms: 0 }
+  }
+
+  // Same split as the validator: a shell command keeps whatever proof did not capture, so
+  // `run: ./verify.sh ${order_id} "$HOME/${OTHER}"` substitutes the first and leaves the rest.
+  const { run: command, ...rest } = c
+  const { filled, missing } = substitute(rest, vars)
+  if (command !== undefined) filled.run = substitute(command, vars).filled
+  if (missing.length) {
+    const why = missing.map(n => (producedBy.has(n)
+      ? `\`${n}\` is captured by "${producedBy.get(n)}", which did not run or did not pass`
+      : `nothing captures \`${n}\``))
+    return {
+      name,
+      kind,
+      asserted: describe(c, kind),
+      ...fail(`the values this check uses are available`, `no value for ${missing.map(n => `\${${n}}`).join(', ')} — ${why.join('; ')}`),
+      ms: 0,
+    }
+  }
+
+  const t0 = Date.now()
+  // Work an app does after it answers — a queued job, a webhook, a read replica catching up —
+  // is not something a single request can see. Without this the only way to verify it was a
+  // `run:` check shelling out to a sleep loop, which is a worse test written worse.
+  const deadline = c.retry_for_ms !== undefined ? t0 + c.retry_for_ms : null
+  let r
+  let attempts = 0
+  for (;;) {
+    attempts += 1
+    // A crashing runner fails its own check; it must not discard the evidence
+    // every earlier check already produced. Only pre-run errors (bad spec,
+    // missing spec) abort the whole run.
+    try {
+      r = await RUNNERS[kind](filled, ctx)
+    } catch (e) {
+      // Flagged, not just described: a crashed runner says nothing about the code it was
+      // pointed at, and a reader deciding what a failure means needs to tell the two apart.
+      r = { ...fail(`${kind} check runs`, `check crashed: ${crashReason(e)}`), crashed: true }
+    }
+    if (r.status === 'passed' || !deadline || Date.now() >= deadline) break
+    await new Promise(res => setTimeout(res, RETRY_INTERVAL_MS))
+  }
+  const ms = Date.now() - t0
+
+  // The number of attempts is the difference between "it never worked" and "it took a while
+  // and then stopped working", and only one of those is a timing problem.
+  if (deadline && r.status === 'failed') {
+    r = { ...r, observed: `${r.observed} — still failing after ${c.retry_for_ms}ms (${attempts} attempt(s))` }
+  }
+  if (deadline && attempts > 1) r = { ...r, attempts }
+
+  // The contract asked for a value this response does not carry. That is an assertion about
+  // the response, so it fails the check rather than quietly leaving the variable unset.
+  const captured = []
+  if (r.status === 'passed' && isPlainObject(filled.capture)) {
+    for (const [varName, selector] of Object.entries(filled.capture)) {
+      const got = captureValue(selector, r.source ?? {})
+      if (got.error) {
+        r = fail(`\`${selector}\` yields ${varName}`, `nothing to capture for \${${varName}} — ${got.error}`, r.output)
+        break
+      }
+      vars.set(varName, got.value)
+      captured.push(varName)
+    }
+  }
+
+  // After the check's own verdict, and only over a pass: a wrong answer delivered quickly is
+  // still the wrong answer, and naming the slowness first would hide it.
+  if (r.status === 'passed' && c.expect_under_ms !== undefined && ms > c.expect_under_ms) {
+    r = fail(`a response in under ${c.expect_under_ms}ms`, `took ${ms}ms`, r.output)
+  }
+
+  // Names only. A captured value is as likely to be a token as an id, and evidence bundles
+  // get shared — the same rule cookie values are held to.
+  return {
+    name,
+    kind,
+    asserted: describe(filled, kind) + (c.retry_for_ms ? `, retried for up to ${c.retry_for_ms}ms` : ''),
+    ...r,
+    ...(captured.length ? { captured } : {}),
+    ms,
+  }
+}
+
+export async function check({ json = false, specPath, only, baseUrl: baseUrlOverride } = {}) {
   const spec = loadSpec(specPath)
 
   // A contract still holding one of proof's own placeholders is unfinished, and an
@@ -868,8 +1202,10 @@ export async function check({ json = false, specPath, only } = {}) {
   }
   const partial = selected.length !== spec.checks.length
 
-  // Read before this run is recorded, so the baseline is the run before it.
-  const before = previousResult(specPath ?? SPEC_PATH)
+  // Read before this run is recorded, so the baseline is the run before it — and the window
+  // behind that is what says whether a check has been disagreeing with itself all along.
+  const history = recentResults(specPath ?? SPEC_PATH, FLAKE_WINDOW)
+  const before = history[0] ?? null
   const previousRun = before?.id ?? null
   // Keyed with what each check asserted, not just its status. A check edited between runs
   // keeps its name, and "passed in run 0001, fails now" then reads as a regression in the
@@ -887,6 +1223,23 @@ export async function check({ json = false, specPath, only } = {}) {
   const serves = serveList(spec)
   const started = []
 
+  // Pointed at something already running — a preview deployment, staging, a stack someone
+  // else brought up. proof starts nothing, so the checks it adds for a serve block are not
+  // claims it can make, and it says so rather than quietly dropping three rows.
+  const against = baseUrlOverride ?? null
+  if (against !== null) {
+    // Same rule as `serve.ready_url`, for the same reason: a scheme-less value can never be
+    // fetched, and every check would fail blaming the deployment for a typo on the command line.
+    let parsed
+    try { parsed = new URL(against) } catch { parsed = null }
+    if (!parsed || !/^https?:$/.test(parsed.protocol)) {
+      throw Object.assign(
+        new Error(`--base-url must be an absolute http(s) URL — "${against}" cannot be fetched`),
+        { code: 'EUSAGE' })
+    }
+  }
+  const baseUrl = against ?? serveBase(serves)
+
   // Captured BEFORE the checks, so the bundle describes the tree that was actually
   // verified rather than whatever it looks like once they finish.
   const git = gitContext()
@@ -903,7 +1256,7 @@ export async function check({ json = false, specPath, only } = {}) {
   // server when nothing selected needs it — `--only "unit tests"` booted the dev server
   // anyway, and a server that would not start failed the run before the selected check ever
   // ran, blocking someone iterating on one unit test for an unrelated reason.
-  const needsApp = !only || selected.some(c => 'http' in c || 'browser' in c)
+  const needsApp = !against && (!only || selected.some(c => 'http' in c || 'browser' in c))
 
   try {
     if (serves.length && needsApp) {
@@ -943,22 +1296,25 @@ export async function check({ json = false, specPath, only } = {}) {
     // ponytail: boot failure short-circuits — every downstream check would fail for the same reason.
     if (!results.some(r => r.status === 'failed')) {
       // one session for the run, shared by the http checks in the order they are written
-      const ctx = { baseUrl: serveBase(serves), runDir, cookies: new Map() }
-      for (const [i, c] of selected.entries()) {
-        const kind = Object.keys(RUNNERS).find(k => k in c)
-        if (!kind) throw new Error(`check "${c.name ?? JSON.stringify(c)}" has no known verb (${Object.keys(RUNNERS).join('|')})`)
-        const t0 = Date.now()
-        // A crashing runner fails its own check; it must not discard the evidence
-        // every earlier check already produced. Only pre-run errors (bad spec,
-        // missing spec) abort the whole run.
-        let r
-        try {
-          r = await RUNNERS[kind](c, ctx)
-        } catch (e) {
-          r = fail(`${kind} check runs`, `check crashed: ${crashReason(e)}`)
+      const ctx = { baseUrl, runDir, cookies: new Map() }
+      // What earlier checks captured. `${order_id}` in a later check resolves from here.
+      const vars = new Map()
+      // Which check produces each name, so a reference that resolves to nothing can say why.
+      const producedBy = new Map()
+      for (const c of selected) {
+        for (const name of Object.keys(isPlainObject(c?.capture) ? c.capture : {})) {
+          if (!producedBy.has(name)) producedBy.set(name, c.name ?? '(unnamed)')
         }
-        // index-suffixed so unnamed checks cannot collide in the results map either
-        results.push({ name: c.name ?? `${kind} check ${i + 1}`, kind, asserted: describe(c, kind), ...r, ms: Date.now() - t0 })
+      }
+
+      for (const batch of batchChecks(selected)) {
+        // A batch of one is the ordinary case and stays exactly as sequential as before.
+        const outcomes = batch.length === 1
+          ? [await runOne(batch[0], ctx, vars, producedBy)]
+          : await Promise.all(batch.map(entry => runOne(entry, ctx, vars, producedBy)))
+        // Back in contract order whatever order they finished in: evidence that reorders
+        // itself between runs cannot be diffed, and `--only` selects by what it shows.
+        results.push(...outcomes)
       }
     }
 
@@ -1012,39 +1368,26 @@ export async function check({ json = false, specPath, only } = {}) {
 
   const serveSkipped = serves.length > 0 && !needsApp
   const failures = results.filter(r => r.status === 'failed')
+  // Checks the contract itself switched off. A completion verdict is a claim about the whole
+  // contract, so one of these withholds it exactly as a subset run does — the difference is
+  // that the reason is written in the file and travels with the diff.
+  const skipped = results.filter(r => r.status === 'skipped').map(r => ({ check: r.name, reason: r.observed }))
+  const incomplete = partial || skipped.length > 0
+  // Evidence proof already had and never read: every run of this contract is on disk, and the
+  // only one ever consulted was the last. A check that passes four runs in five rendered
+  // exactly like one that always passes.
+  const flaky = flakiness(history, results)
 
-  // The product's whole premise: a green test suite is not the same as a satisfied
-  // requirement. A contract made only of `run:` commands proves exactly the thing
-  // the tool exists to distrust, so say so — on a pass, where the false confidence is.
-  const acceptance = spec.checks.some(c => 'http' in c || 'browser' in c || 'env' in c)
-
-  // A status code says the app answered, not what it answered with. `infer` can only
-  // generate `expect: {status: 200}` — it cannot know the requirement — so a contract built
-  // from generated checks passes on a 200 carrying exactly the wrong body.
-  const responseChecks = spec.checks.filter(c => 'http' in c || 'browser' in c)
-  const assertsContent = c =>
-    (c.http && (c.http.expect?.body_contains !== undefined || c.http.expect?.json !== undefined))
-    || (c.browser && (c.browser.flow ?? []).some(s => s?.expect_text !== undefined || s?.expect_request !== undefined))
-
-  // Three different gaps, narrowing. Saying "nothing exercises the running application"
-  // when `app boots` just passed is false: the app was started and answered. What is
-  // missing there is narrower, and naming it precisely is the difference between advice
-  // someone acts on and a caveat they learn to skip.
   const appStarted = serves.length > 0 && !serveSkipped
   // Not on a subset run. Every advisory is a statement about what the whole contract proves,
   // and a subset did not run the whole contract — the INCOMPLETE verdict already says the
   // run makes no completion claim. Reporting "no http check asserts content" for checks that
   // were never selected is a caveat about something the reader did not ask for.
-  const advisory = partial ? null
-    : failures.length ? null
-    : !acceptance && appStarted ? ADVISORY.liveness_only
-      : !acceptance ? ADVISORY.no_runtime
-        : responseChecks.length && !responseChecks.some(assertsContent) ? ADVISORY.status_only
-          : null
+  const advisory = incomplete || failures.length ? null : contractAdvisory(spec, { appStarted })
   const assertedBy = new Map(results.map(r => [r.name, r.asserted ?? null]))
 
   const result = {
-    status: failures.length ? 'failed' : partial ? 'partial' : 'passed',
+    status: failures.length ? 'failed' : incomplete ? 'partial' : 'passed',
     goal: spec.goal ?? null,
     // Which contract this verdict is about. With `--spec` a project can have several, and
     // they all write into one `.proof/runs` — two contracts sharing a goal produced runs
@@ -1057,8 +1400,31 @@ export async function check({ json = false, specPath, only } = {}) {
     only: only ?? null,
     // Said out loud: the absence of `app boots` from a subset run is a decision, not a gap.
     serve_skipped: serveSkipped,
+    // Checks switched off in the contract, each with the reason written beside it.
+    skipped,
+    // Checks whose recent history holds both outcomes for the same assertion.
+    flaky,
+    // The app this run was pointed at, when it was not one proof started.
+    against,
     advisory,
     warnings: [
+      // Nothing here was started, so three of the checks a serve block earns are claims proof
+      // cannot make, and `env:` reads proof's own environment rather than the deployment's.
+      // A run that dropped those rows silently would look like a contract that never had them.
+      ...(against
+        ? [`checks ran against ${against}, which proof did not start — \`app boots\`, \`app still running\``
+          + " and the log gate were not run, `run:` and `file:` checks still ran here, and an `env:` check"
+          + " reads proof's own environment rather than that deployment's"]
+        : []),
+      // The same rule as `--only`: a switched-off check is a hole in the verdict, and it has
+      // to be visible in the run rather than only in the file.
+      // A green run carrying one of these is the case worth interrupting: the verdict is the
+      // thing being trusted, and it was arrived at by a check that does not always agree.
+      ...flaky.map(fillFlakyNotice),
+      ...(skipped.length
+        ? [`${skipped.length} check(s) are skipped in the contract (${skipped.map(s => `${s.check}: ${s.reason}`).join('; ')})`
+          + ' — this run cannot report completion while they are']
+        : []),
       // `changed` says this too, but the DONE verdict is the thing CI and agents act on, and
       // a verdict is a claim about a contract. If this diff rewrote the contract, the claim
       // is against expectations the same diff set — which the verdict alone cannot show.
@@ -1097,10 +1463,11 @@ export async function check({ json = false, specPath, only } = {}) {
     // total made a subset run report "selected 3 of 4" when it had covered 1 of 3.
     contract_checks: spec.checks.length,
     selected_checks: selected.length,
-    ran_checks: results.filter(r => r.kind !== 'serve').length,
+    ran_checks: results.filter(r => r.kind !== 'serve' && r.status !== 'skipped').length,
     checks: Object.fromEntries(results.map(r => [r.name, r.status])),
-    // `full` is stripped here: result.json stays readable, commands.log holds everything
-    results: results.map(({ full, ...rest }) => rest),
+    // `full` and `source` are stripped here: result.json stays readable, commands.log holds
+    // everything the command said, and a capture source carries headers and whole bodies.
+    results: results.map(({ full, source, ...rest }) => rest),
     // Always all five keys. JSON.stringify drops undefined, so a failure with no output
     // used to lose the field entirely — and an agent reading failure.output would crash
     // on exactly the failures that carry the least context.
@@ -1146,13 +1513,16 @@ export const VERDICT = {
   partial: 'INCOMPLETE — selected checks passed; run `proof check` for a completion verdict',
 }
 
+/** The tag in the CHECKS column. A skip is neither of the two things a verdict is made of. */
+export const STATUS_TAG = { passed: 'PASS', failed: 'FAIL', skipped: 'SKIP' }
+
 function printHuman(r) {
   const names = r.results.map(x => truncateToWidth(x.name, NAME_COLUMN_MAX))
   const w = columnWidth(r.results.map(x => x.name), NAME_COLUMN_MAX)
   console.log('\nPROOF')
   if (r.goal) console.log(`\nRequirement:\n${block(r.goal, '  ')}`)
   console.log('\nCHECKS')
-  r.results.forEach((c, i) => console.log(`  ${padTo(names[i], w + 2)}${c.status === 'passed' ? 'PASS' : 'FAIL'}`))
+  r.results.forEach((c, i) => console.log(`  ${padTo(names[i], w + 2)}${STATUS_TAG[c.status] ?? 'FAIL'}`))
   for (const f of r.failures) {
     console.log(`\nFAILURE\n  Check:\n    ${f.check}`)
     // The one fact that separates "this change broke it" from "this change did not fix it".
@@ -1174,6 +1544,9 @@ function printHuman(r) {
     const skipped = r.serve_skipped ? ' The serve block was not started: nothing selected needs it.' : ''
     console.log(`\nSubset run: --only "${r.only}" selected ${r.selected_checks} of ${r.contract_checks} check(s).${skipped}`)
   }
+  if (r.skipped?.length) {
+    console.log(`\nSKIPPED\n${r.skipped.map(s => `  ${s.check} — ${s.reason}`).join('\n')}`)
+  }
   const indent = w => wrap(w, TERMINAL_WIDTH - 2).map(l => `  ${l}`).join('\n')
   if (r.warnings?.length) {
     // Blank line between them: these are separate facts, and run together as one block the
@@ -1187,9 +1560,12 @@ function printHuman(r) {
   console.log(`\nEvidence:\n  ${join(r.run, 'result.json')}\n  ${join(r.run, 'commands.log')}`)
   // A tally, because at any size past a handful nobody counts the rows — and past a
   // screenful the list has scrolled away by the time the verdict appears.
-  const ran = r.results.length
-  const failed = r.results.filter(c => c.status === 'failed').length
-  const tally = failed ? `${ran - failed} passed, ${failed} failed` : `${ran} passed`
+  const count = status => r.results.filter(c => c.status === status).length
+  const tally = [
+    `${count('passed')} passed`,
+    ...(count('failed') ? [`${count('failed')} failed`] : []),
+    ...(count('skipped') ? [`${count('skipped')} skipped`] : []),
+  ].join(', ')
 
   // On its own line: the INCOMPLETE verdict already carries a sentence, and appending to it
   // produced a run-on with two em-dashes.

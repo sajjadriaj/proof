@@ -1,8 +1,18 @@
 {
   "name": "@sajjadriaj/proof",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Independent verification layer for AI coding agents",
   "type": "module",
+  "license": "MIT",
+  "author": "sajjadriaj",
+  "homepage": "https://github.com/sajjadriaj/proof#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sajjadriaj/proof.git"
+  },
+  "bugs": {
+    "url": "https://github.com/sajjadriaj/proof/issues"
+  },
   "bin": {
     "proof": "bin/proof.js"
   },
@@ -16,11 +26,13 @@
   "files": [
     "bin",
     "src",
+    "schema",
     "README.md",
     "LICENSE"
   ],
   "scripts": {
-    "test": "node test/run.js"
+    "test": "node test/run.js",
+    "schema": "node scripts/schema.js"
   },
   "peerDependencies": {
     "playwright": ">=1.40"
@@ -36,8 +48,10 @@
   "engines": {
     "node": ">=20"
   },
-  "license": "MIT",
   "devDependencies": {
     "playwright": "^1.62.1"
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }

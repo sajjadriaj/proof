@@ -284,6 +284,7 @@ export function init(requirement, { json = false, force = false, specPath } = {}
 
   const checks = discoverChecks()
   const serveCommand = discoverServeCommand()
+  const port = serveCommand ? detectPort(serveCommand) : null
   const spec = {
     goal: requirement,
     checks: checks.length ? checks : [{ name: 'tests', run: [...PLACEHOLDER_RUN.keys()][0] }],
@@ -299,7 +300,7 @@ export function init(requirement, { json = false, force = false, specPath } = {}
 
   withSpecLock(() => {
     if (replacing !== null) writeFileAtomic(backup, replacing)
-    writeFileAtomic(path, header(checks.length, serveCommand) + doc.toString())
+    writeFileAtomic(path, header(checks.length, serveCommand, port) + doc.toString())
   })
   // Only for proof's own directory: evidence and locks live there whatever the contract's
   // path, and writing a .gitignore into someone else's directory is not proof's business.
@@ -311,6 +312,9 @@ export function init(requirement, { json = false, force = false, specPath } = {}
     spec: path,
     discovered: checks.map(c => c.name),
     serve_command: serveCommand,
+    // Live when proof had evidence for the port, commented when it would have been a guess.
+    serve_live: Boolean(serveCommand && port),
+    port: port?.port ?? null,
     replaced: replacing === null ? null : backup,
   }
   if (json) console.log(JSON.stringify(out, null, 2))
@@ -320,11 +324,18 @@ export function init(requirement, { json = false, force = false, specPath } = {}
     console.log(checks.length
       ? `discovered ${checks.length} check(s): ${checks.map(c => c.name).join(', ')}`
       : 'no build/test commands discovered — edit the spec by hand')
-    if (serveCommand) {
+    if (serveCommand && port) {
+      console.log(`\nfound \`${serveCommand}\` on port ${port.port} (${port.from}) — the serve block is live, so http and browser checks resolve against it.`)
+    } else if (serveCommand) {
       console.log(`\nfound \`${serveCommand}\` — a serve block using it is scaffolded (commented) in the spec.`)
       console.log('Uncomment it and confirm the port to enable http and browser checks.')
     }
-    console.log(`\nnext: add acceptance checks that prove the requirement, then run \`proof check\`\n`)
+    console.log('\nnext:')
+    console.log('  proof infer          routes and settings in this repo nothing verifies yet; --write adds them')
+    console.log('  proof lint           how much the contract proves, before spending a run on it')
+    console.log('  proof falsify        confirm it fails without your change, or it is not testing it')
+    console.log('  proof check          execute it\n')
+    console.log('Writing checks that mean something: docs/writing-a-contract.md\n')
   }
   return out
 }
@@ -389,40 +400,95 @@ export function discoverServeCommand() {
   return null
 }
 
-// Scaffolded commented rather than live: the command is read from package.json, but the
-// port is not something proof can know, and a wrong ready_url is worse than an absent one.
 /**
- * A port only where the ecosystem has one convention. Elsewhere a placeholder that cannot be
- * mistaken for a working value: a confident wrong port produces a serve block that fails to
- * boot, and a failing boot short-circuits every check after it.
+ * Where the dev server listens, read from what the project says rather than guessed.
+ *
+ * Three sources, in order of how much they are the project's own word: a port written into
+ * the dev script itself (`next dev -p 4000`, `PORT=8080 node server.js`), one in a `.env`
+ * file, and the default the framework in `package.json` ships with. Each says how sure it is,
+ * because the scaffold below goes live only on real evidence — a wrong `ready_url` boots
+ * nothing, and a failing boot short-circuits every check after it.
  */
-const readyUrlFor = cmd => {
-  if (!cmd) return 'http://localhost:<port>'
-  if (/^python3? manage\.py/.test(cmd)) return 'http://localhost:8000'
-  if (cmd.startsWith('npm run')) return 'http://localhost:3000'
-  return 'http://localhost:<port>'
+const FRAMEWORK_PORTS = [
+  ['next', 3000], ['nuxt', 3000], ['@remix-run/dev', 3000], ['react-scripts', 3000],
+  ['@sveltejs/kit', 5173], ['vite', 5173], ['astro', 4321], ['@angular/cli', 4200], ['gatsby', 8000],
+]
+
+const scriptBody = cmd => {
+  const m = cmd?.match(/^npm run (\S+)/)
+  if (!m) return null
+  try { return JSON.parse(readFileSync('package.json', 'utf8')).scripts?.[m[1]] ?? null } catch { return null }
 }
 
-const serveBlock = cmd => `#
+const explicitPort = text =>
+  text?.match(/(?:--port[= ]|-p |\bPORT=)(\d{2,5})\b/)?.[1] ?? null
+
+export function detectPort(cmd) {
+  const fromScript = explicitPort(scriptBody(cmd)) ?? explicitPort(cmd)
+  if (fromScript) return { port: fromScript, from: 'the dev script' }
+
+  for (const file of ['.env', '.env.local', '.env.example']) {
+    let port = null
+    try { port = readFileSync(file, 'utf8').match(/^\s*(?:export\s+)?PORT\s*=\s*["']?(\d{2,5})/m)?.[1] ?? null } catch {}
+    if (port) return { port, from: file }
+  }
+
+  if (/^python3? manage\.py/.test(cmd ?? '')) return { port: '8000', from: "Django's default" }
+
+  try {
+    const pkg = JSON.parse(readFileSync('package.json', 'utf8'))
+    const deps = { ...pkg.dependencies, ...pkg.devDependencies }
+    const hit = FRAMEWORK_PORTS.find(([name]) => name in deps)
+    if (hit) return { port: String(hit[1]), from: `${hit[0]}'s default` }
+  } catch {}
+
+  return null
+}
+
+/**
+ * Live when the port is the project's own word or its framework's convention; commented,
+ * with the command already filled in, when proof would only be guessing. A live block that
+ * points at the wrong port fails one run at `app boots` with the URL in the message — a
+ * commented one has to be found, read and finished by hand before any http check can exist.
+ */
+const serveBlock = (cmd, port) => {
+  if (cmd && port) {
+    return `#
+# This project starts with \`${cmd}\` and listens on ${port.port} (${port.from}). Relative paths
+# in http and browser checks resolve against ready_url. If the port is wrong, \`app boots\`
+# says so on the first run.
+serve:
+  run: ${cmd}
+  ready_url: http://localhost:${port.port}
+  timeout: 60
+`
+  }
+  const guess = cmd?.startsWith('npm run') ? 'http://localhost:3000' : 'http://localhost:<port>'
+  return `#
 # ${cmd ? `This project starts with \`${cmd}\`. Uncomment` : 'To add http or browser checks, uncomment'} the block below and confirm the port.
 # Relative paths in http and browser checks resolve against ready_url:
 #
 # serve:
 #   run: ${cmd ?? '<your dev command>'}
-#   ready_url: ${readyUrlFor(cmd)}
+#   ready_url: ${guess}
 #   timeout: 60
 #
 # An app with no HTTP surface — a worker, a daemon, a queue consumer — is ready when its own
 # log says so. Use \`ready_log: "<a line it prints once up>"\` in place of ready_url.
 `
+}
 
-const header = (n, serveCommand) => `# Acceptance contract. Edit freely — this file is the definition of "done".
+/** Editor completion and unknown-key underlines, from the schema the validator generates. */
+export const SCHEMA_LINE = '# yaml-language-server: $schema=https://raw.githubusercontent.com/sajjadriaj/proof/main/schema/spec.schema.json'
+
+const header = (n, serveCommand, port) => `${SCHEMA_LINE}
+# Acceptance contract. Edit freely — this file is the definition of "done".
 #
 # Verbs:
 #   run:  <shell command>          expect_exit: 0   expect_output: "substring"
-#   http: {method, path|url, headers, body, expect: {status, body_contains, body_not_contains, json}}
+#   http: {method, path|url, headers, body, concurrent, expect: {status, statuses, headers, body_contains, body_not_contains, json}}
 #   file: <path>  |  {path, exists, contains, not_contains}
 #   env:  <NAME>  |  {name, matches}
 #   browser: {visit, flow: [...]}
-${serveBlock(serveCommand)}#
+${serveBlock(serveCommand, port)}#
 ${n ? '' : '# No project commands were auto-discovered — replace the placeholder below.\n#\n'}`

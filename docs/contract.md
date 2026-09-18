@@ -56,9 +56,9 @@ checks:
 
 | Verb | Shape | Notes |
 | --- | --- | --- |
-| `run` | `run: <shell command>` | `expect_exit` (default 0), `expect_output` (substring), `timeout` (seconds, default 600) |
+| `run` | `run: <shell command>` | `expect_exit` (default 0), `expect_output` (substring), `results` (a JUnit report the command wrote), `timeout` (seconds, default 600) |
 | — | `timeout` on any check | The budget for that whole check, never per step. A `browser` flow gets `timeout` seconds in total (default 60), not `timeout` seconds each. Must be greater than zero — there is no "unlimited" value, and `0` in most tools means the opposite of what it would mean here. |
-| `http` | `http: {method, path\|url, headers, body, expect: {status, body_contains, body_not_contains, json}}` | `path` resolves against `serve.ready_url`; object bodies are sent as JSON. With no `expect`, any status `>= 400` fails — a 500 answering the phone is not a pass |
+| `http` | `http: {method, path\|url, headers, body, concurrent, expect: {status, statuses, headers, body_contains, body_not_contains, json}}` | `path` resolves against `serve.ready_url`; object bodies are sent as JSON. With no `expect`, any status `>= 400` fails — a 500 answering the phone is not a pass |
 | `file` | `file: <path>` or `file: {path, exists, contains, not_contains}` | Asserts a **regular file** — a directory of that name fails. `exists: false` asserts absence; use `run: test -d <path>` for a directory. `not_contains` verifies a removal, and fails on a missing file rather than passing vacuously |
 | `env` | `env: <NAME>` or `env: {name, matches}` | Reads **proof's own environment** (see below). Never echoes the value — these usually cover secrets |
 | `browser` | `browser: {visit, flow, base_url, expect_no_console_errors}` | Needs Playwright |
@@ -144,6 +144,150 @@ Serialising an object as JSON while labelling it a form would send a request no 
 ever produce, and not the one the contract describes. Where `proof` cannot encode faithfully
 it refuses rather than guesses. String bodies are sent verbatim and never relabelled.
 
+### Letting another runner report for itself
+
+`run: npx playwright test` works, and tells proof one thing: the exit code. Three tests failed
+and the verdict says `exit 1`, so the evidence bundle holds less than the terminal it came from.
+Name the report the runner writes and the failures arrive with the tests attached:
+
+```yaml
+- name: the browser suite
+  run: npx playwright test --reporter=junit
+  results: results.xml
+```
+
+```
+Expected:
+  2 test(s) pass
+Observed:
+  1 of 2 failed:
+    auth › rejects an expired token — expected 401, got 200
+```
+
+JUnit XML, because it is the one format every runner can already write — Playwright and Vitest
+natively, pytest with `--junitxml=`, Jest and Mocha with a reporter, Go through gotestsum, Rust
+through nextest. Reading a format rather than reimplementing a runner is the whole point: the
+`browser:` verb is a thin Playwright, and for anything that needs fixtures, factories or
+parameterized cases you should write the test and reach it from here.
+
+Three things it catches that an exit code cannot:
+
+- **A report of zero tests fails.** `--grep` that matches nothing runs nothing and exits 0 —
+  the exact class of bug this tool exists for, arriving through the check written to catch the
+  others.
+- **A missing report fails**, naming the likely cause: the reporter flag, or a path the runner
+  wrote somewhere else.
+- **A clean report with a bad exit code still fails**, and says so — `exit 3, though every test
+  in the report passed` means something other than the tests broke.
+
+The report is attached to the run as evidence either way.
+
+### Response headers
+
+Half of what an API promises is in the headers: where the thing it just created lives, whether
+the session cookie is safe to hand a browser, what it encoded the body as, whether the answer
+may be cached.
+
+```yaml
+- name: a created order reports where it lives, and is not cacheable
+  http:
+    method: POST
+    path: /orders
+    body: {sku: ABC-1}
+    expect:
+      status: 201
+      headers:
+        location: "/orders/"
+        content-type: "application/json"
+        cache-control: "no-store"
+
+- name: the session cookie cannot be read by script
+  http:
+    method: POST
+    path: /login
+    body: {user: ada, password: hunter2}
+    expect: {status: 200, headers: {set-cookie: "HttpOnly"}}
+```
+
+Each value is matched as a **substring**, and the name case-insensitively. `content-type`
+carries a charset, `cache-control` carries a list, `set-cookie` carries flags — asserting any
+of those exactly means rewriting the check the first time an unrelated directive is added.
+
+Several `Set-Cookie` headers stay several rather than being joined into one value. Joined,
+`HttpOnly` on your session cookie would read as `HttpOnly` on the tracking cookie beside it —
+and that is precisely the assertion people write here.
+
+An absent header is reported as absent (`no x-request-id header`), not as a mismatch against
+an empty string.
+
+### Races
+
+A sequence of requests cannot show a race. Ask twice in a row and you get 201 then 409 whether
+the lock works or not; the bug is that both succeed when they arrive *together*.
+
+```yaml
+- name: only one of five simultaneous claims on an order wins
+  http:
+    method: POST
+    path: "/orders/${order_id}/claim"
+    concurrent: 5
+    expect:
+      statuses: {201: 1, 409: 4}
+```
+
+`concurrent: n` fires the same request n times at once. `expect.statuses` is a tally of what
+came back, and it is the only assertion that shape of question has:
+
+```
+Expected:
+  5 at once: 1×201, 4×409
+Observed:
+  5 at once: 5×201
+```
+
+That is a check-and-set straddling an `await`, an idempotency key that is not enforced, or two
+writers on one row — the failures that only ever appear under load, written down as a check.
+
+Four rules keep it meaning one thing:
+
+- **The tally must account for every request.** `concurrent: 5` with `{201: 1, 409: 2}` is
+  refused: the two it says nothing about are exactly where a broken lock shows up.
+- **The other `expect` keys are refused alongside it.** There are several responses, and
+  applying `body_contains` to one of them — or to all — would be a guess about which was meant.
+  Assert the outcome here and what the winner produced in a check after it.
+- **`capture` is refused** for the same reason: there is no single response to read a value from.
+- **Nothing is written to the cookie jar.** Several responses may each carry a `Set-Cookie` and
+  there is no order among them, so keeping one would be picking arbitrarily.
+
+A request that never completes is reported as that rather than counted, since a timeout is not
+a status. At most 50 at once: past that a check is measuring your dev server's accept queue
+rather than your application.
+
+### Waiting for work the app does after it answers
+
+A queued job, a webhook, a read replica catching up: a single request cannot see any of it.
+`retry_for_ms` re-runs the whole check until it passes or the budget is gone.
+
+```yaml
+- name: the export is accepted for later
+  http: {method: POST, path: /exports, expect: {status: 202, json: {job_id: "<string>"}}}
+  capture: {job_id: json.job_id}
+
+- name: and the worker finishes it
+  http: {path: "/exports/${job_id}", expect: {status: 200, json: {state: done}}}
+  retry_for_ms: 30000
+```
+
+It asks again every 250 ms. On a failure the observed value says how long it waited and how
+many times it asked — the difference between "it never worked" and "it worked and then stopped"
+is the number of attempts. It applies to every verb, so a `file:` check can wait for a file a
+worker writes.
+
+`timeout` still bounds each individual attempt; `retry_for_ms` bounds the loop around them.
+`retry_for_ms` and `expect_under_ms` are refused together: one says take as long as you need
+and the other says be quick, and whichever proof honoured would make the other a written
+assertion that never ran.
+
 ### Response shape
 
 `expect.json` matches a subset: everything the contract names must be present and match,
@@ -162,6 +306,163 @@ Failures name the exact path, so a drifted response reads as
 `$.user.id = <number>` / `$.user.id was "42"` rather than a substring test that passes
 because the right characters happened to appear somewhere in the body. A non-JSON
 response reports its content-type, which is how an HTML error page usually announces itself.
+
+### Values one check produces and a later one uses
+
+The most ordinary thing there is to say about an API is "create it, then read it back". Give a
+check a `capture` block and the values it names become `${...}` in every check after it:
+
+```yaml
+- name: an order is created
+  http:
+    method: POST
+    path: /orders
+    body: {sku: ABC-1}
+    expect: {status: 201}
+  capture:
+    order_id: json.id
+    where: header.location
+
+- name: the order is readable at the id it was given
+  http:
+    path: /orders/${order_id}
+    expect: {status: 200, json: {id: "${order_id}", sku: ABC-1}}
+```
+
+| Selector | Reads |
+| --- | --- |
+| `json.<path>` | A value from the parsed JSON body — `json.id`, `json.user.email`, `json.items[0].sku` |
+| `header.<name>` | A response header — `header.location` |
+| `status` | The response status |
+| `output` | The command's trimmed stdout and stderr (`run` checks) |
+| `match:<regex>` | The first capturing group, over the body or the output — `match:token=(\w+)` |
+
+Without this every path had to be a literal, so contracts hardcoded a row someone had seen in
+their own database once — a check that passes on one machine and 404s on every other.
+
+A reference that is the **whole** value keeps the captured type, so `json: {id: "${order_id}"}`
+compares as the number it was. Embedded in a longer string it is stringified, which is what a
+URL wants.
+
+Four rules keep a captured value from meaning less than it looks:
+
+- **A `${name}` nothing captures is a contract error**, reported at load with the check that
+  would have produced it if the order is simply wrong. It is a typo, not a failure, and
+  finding it after booting the app and running everything before it would be a waste.
+- **Capture happens only on a pass.** A value read off a failed response is read off the wrong
+  thing. Later checks then fail saying which check was supposed to produce it.
+- **A selector that finds nothing fails the check that promised it.** The contract said the
+  response carries an id; it did not. A variable that silently became `""` would build a
+  request to `/orders/` and report whatever came back.
+- **Names only in the evidence.** `results[].captured` lists what a check captured, never the
+  values — a captured value is as likely to be a token as an id, and bundles get shared.
+
+A `serve` block cannot use one: it starts before any check runs, so there is nothing captured
+yet for a reference to resolve to.
+
+A `run:` command is the exception to the first rule, because `${...}` is the shell's syntax
+before it is proof's. A name proof captured is substituted there; every other one is left
+untouched for the shell, and an unknown one is not a contract error:
+
+```yaml
+- name: the receipt is generated for that order
+  run: ./scripts/receipt.sh ${order_id} > "$HOME/${OUT_DIR}/receipt.txt"
+```
+
+`${order_id}` is filled in, `${OUT_DIR}` reaches the shell. Rejecting the second would be
+refusing an ordinary command for using the language it is written in — the same reason
+`proof guard` does not parse the agent's flags. Everywhere else a `${name}` has no other
+meaning, so an unknown one is still refused at load.
+
+### Running independent checks together
+
+A contract's order is its dependency order — a login before the profile read, a seed before
+the assertion — so checks run one at a time. Mark the ones that genuinely do not depend on
+each other and consecutive marked checks run together:
+
+```yaml
+- name: it builds
+  run: npm run build
+  parallel: true
+- name: types check
+  run: npm run typecheck
+  parallel: true
+- name: the suite passes
+  run: npm test
+  parallel: true
+- name: the profile page shows the user
+  http: {path: /profile, expect: {status: 200, body_contains: "ada"}}
+```
+
+A run of marked checks is one batch, and the batch is a **barrier**: everything before it
+finishes first, and nothing after it starts until all of it is done. Results are recorded in
+contract order however they finish, so evidence still diffs between runs.
+
+The batch shares the run's cookie jar, and writes to it during a batch are not ordered — so a
+check that logs in, or that depends on one, does not belong in one. `capture` is refused on a
+parallel check for the same reason: nothing has a defined place in the order to read it.
+
+### Asserting how long it took
+
+`expect_under_ms` gates a check on its own wall clock:
+
+```yaml
+- name: the dashboard responds quickly with a full table
+  http: {path: /dashboard, expect: {status: 200, body_contains: "Revenue"}}
+  expect_under_ms: 400
+```
+
+It is applied after the check's own verdict, so a wrong answer is reported as wrong rather
+than as slow — naming the slowness first would hide the failure the check is about. The
+measurement includes whatever the verb costs, process spawn included for `run:`.
+
+One measurement is not a latency guarantee. This is a smoke gate for a requirement phrased in
+time; a benchmark belongs in a `run:` check with a tool built for it.
+
+### Switching a check off without deleting it
+
+A check that cannot run today gets `skip` with the reason:
+
+```yaml
+- name: the sandbox refund path
+  http: {path: /refunds/latest, expect: {status: 200}}
+  skip: "the sandbox API is down — see #412"
+```
+
+The alternative people reach for is deleting the check, which is invisible in a blast radius
+(`.proof/` is not code under test) and leaves the next run reporting `DONE`. A skip is
+visible in three places instead: the `SKIPPED` section of the run, the report, and the diff.
+
+A skipped check does not run and is not a failure — but the run reports `INCOMPLETE`, never
+`DONE`, for the same reason a `--only` subset does: completion is a claim about the whole
+contract. `proof guard` refuses to start against a contract holding one, since no attempt
+could ever end with a completion verdict.
+
+A skip with no reason is refused. A skip nobody wrote a reason for is one nobody can ever
+decide to remove.
+
+### How much of a response proof will read
+
+Assertions always run against the **whole** body. Only what is stored inline is bounded — at
+4000 characters, marked as cut, with the full body kept beside the failure in the evidence
+bundle. A body clipped with no marker looks complete, and can appear to contradict the very
+failure it accompanies.
+
+Past **8 MB** `proof` stops reading and fails the check rather than assert on what it has:
+
+```
+Expected:
+  a response proof can assert on
+Observed:
+  status 200, but the body passed 8 MB and proof stopped reading it — asserting on the part
+  that fitted would be an answer about half a response. Stream a payload this size with a
+  `run:` check and assert on what it wrote with a `file:` check.
+```
+
+Half a body is the wrong answer in both directions: `body_contains` would miss a match past
+the cut, and `body_not_contains` would pass over a string sitting in the half never read. The
+`file` verb searches without holding the file in memory, so an export that size is checked by
+writing it and asserting on what was written.
 
 ### Runtime health
 
@@ -280,7 +581,20 @@ OBSERVED BUT NOT GATED
   holds. Add a `ready_url`, or run the app in the foreground.
 ```
 
-Give **both** and the log gates readiness while the URL stays the base for relative `http`
+An HTTP app that announces itself in its log rather than at a URL still needs somewhere for
+relative paths to resolve against. That is what `url:` is for, beside `ready_log`:
+
+```yaml
+serve:
+  run: node server.mjs
+  ready_log: "api listening"
+  url: http://localhost:8901
+```
+
+Without it every relative `path` is a contract error — a log line saying the app is up is not
+an address, and the refusal names `url:` rather than leaving you to find it.
+
+Give **both** `ready_log` and `ready_url` and the log gates readiness while the URL stays the base for relative `http`
 and `browser` paths. That is the case where an app binds its port before it has finished the
 work that makes it usable: polling the port would call that ready, and the log line is what
 says the work is done.

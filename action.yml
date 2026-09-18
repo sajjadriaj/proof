@@ -1,0 +1,76 @@
+name: proof
+description: Run an acceptance contract against the running application and report the verdict.
+author: sajjadriaj
+
+branding:
+  icon: check-circle
+  color: green
+
+inputs:
+  spec:
+    description: Contract path. Defaults to .proof/spec.yaml.
+    required: false
+  only:
+    description: Run only checks whose name contains this text. Reports INCOMPLETE, never DONE.
+    required: false
+  base-url:
+    description: Verify an app already running at this URL instead of starting one.
+    required: false
+  junit:
+    description: Path to write JUnit XML to. Empty means none.
+    required: false
+    default: proof-results.xml
+  summary:
+    description: Append the run's markdown report to the job summary.
+    required: false
+    default: 'true'
+
+outputs:
+  status:
+    description: passed, failed or partial.
+    value: ${{ steps.check.outputs.status }}
+  run:
+    description: The evidence directory for this run.
+    value: ${{ steps.check.outputs.run }}
+
+runs:
+  using: composite
+  steps:
+    - id: check
+      shell: bash
+      # The verdict is the exit code, and it has to survive the steps that report it — so the
+      # status is read off the run record rather than inferred from whichever step ran last.
+      run: |
+        set -o pipefail
+        args=()
+        [ -n "${{ inputs.spec }}" ] && args+=(--spec "${{ inputs.spec }}")
+        [ -n "${{ inputs.only }}" ] && args+=(--only "${{ inputs.only }}")
+        [ -n "${{ inputs.base-url }}" ] && args+=(--base-url "${{ inputs.base-url }}")
+
+        set +e
+        npx --no-install proof check "${args[@]}"
+        code=$?
+        set -e
+
+        record=$(ls -d .proof/runs/*/ 2>/dev/null | sort | tail -n 1)
+        echo "run=${record%/}" >> "$GITHUB_OUTPUT"
+        if [ -f "${record}result.json" ]; then
+          node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).status)' \
+            "${record}result.json" > /tmp/proof-status
+          echo "status=$(cat /tmp/proof-status)" >> "$GITHUB_OUTPUT"
+        fi
+        echo "PROOF_EXIT=$code" >> "$GITHUB_ENV"
+
+    - shell: bash
+      if: ${{ always() && inputs.junit != '' }}
+      run: npx --no-install proof report --junit > "${{ inputs.junit }}" || true
+
+    - shell: bash
+      if: ${{ always() && inputs.summary == 'true' }}
+      # The report is markdown already; the job summary is where a reviewer will actually see
+      # it, rather than folded inside a log nobody opens.
+      run: npx --no-install proof report >> "$GITHUB_STEP_SUMMARY" || true
+
+    - shell: bash
+      # Last, so the caveats above are published whatever the verdict was.
+      run: exit "${PROOF_EXIT:-1}"

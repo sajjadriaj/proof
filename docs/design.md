@@ -70,11 +70,52 @@ next refusal, reported early rather than discovered after the others are fixed.
 **Human inspectable.** The contract is readable YAML. No verification logic hides inside
 opaque agent behavior.
 
+## Do not trust the contract either
+
+Every principle above is about distrusting the implementation. The contract is the other place
+a verdict can go wrong, and it goes wrong silently: a check that passes on code that never had
+the feature reports DONE for a branch that did nothing.
+
+`proof falsify` checks the base commit out into a temporary worktree, runs the **current**
+contract against it, and reports whether anything failed. Three answers, not two — a base that
+would not boot, a runner that crashed, or a command that exits 127 makes the contract "fail"
+for a reason that says nothing about the change, and calling that *discriminates* would be the
+same false confidence the rest of this refuses to give.
+
+It also produces the distinction a test suite cannot: which checks carry the requirement, and
+which are regression guards that would pass either way.
+
+## The contract has to be readable
+
+The contract is the definition of "done", which makes it something a human reviews. A file
+nobody can read is a file nobody reviews, so `proof lint` reads it back as what each check
+asserts — from the same strings the run records as `asserted`, rather than a second description
+of the language that can drift from the first.
+
+That is also why the contract is not written in English. A natural-language spec a machine
+executes is either a model interpreting it — which puts a model back in the judging seat, the
+one thing this tool exists to remove — or an English-shaped grammar whose glue code becomes the
+real test while the prose becomes decoration. English is the *input*: `proof init "<requirement>"`
+takes a sentence, and `infer`, `lint` and `falsify` are how you find out whether the checks it
+became mean anything.
+
+## Not a place to put logic
+
+No fixtures, no factories, no mocks, no parameterized cases, no setup and teardown. The moment
+a check needs code, that check is a test, and the right way to reach it from here is
+`run: npx playwright test smoke.spec.ts`. A contract that grew an expression language would be
+a worse test framework beside two good ones.
+
 ## Non-goals
 
 Not a coding agent, not an IDE, not a replacement for unit tests or Playwright, not a CI
 platform, not an MCP server. `proof` sits one layer above your existing tools and asks one
 narrower question: does the implemented change actually satisfy the requirement?
+
+The value of that scales with how much you are delegating. With a careful human writing the
+code and a review culture that catches weak tests, most of this is buying you very little. In
+an agent loop, where the suite is the thing the agent already passes while being wrong, it is
+buying you the verdict.
 
 ## Development
 

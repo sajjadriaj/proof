@@ -58,62 +58,76 @@ const SPECIFIER = /(?:\bfrom\s*|\brequire\s*\(\s*|\bimport\s*\(?\s*)['"]([^'"]+)
 const REGEX_POSITION = /[(,=:[!&|?{};+\-*%^~<>]$/
 const REGEX_KEYWORD = /\b(?:return|typeof|instanceof|in|of|new|delete|void|case|do|else|yield|await)$/
 
-const startsRegex = before => {
-  const trimmed = before.trimEnd()
-  return trimmed === '' || REGEX_POSITION.test(trimmed) || REGEX_KEYWORD.test(trimmed)
-}
+// Longer than any keyword above, so `\b` still has a character in front of it to anchor on.
+const LOOKBEHIND = 16
 
+const startsRegex = tail => tail === '' || REGEX_POSITION.test(tail) || REGEX_KEYWORD.test(tail)
+
+/**
+ * Only the last few characters decide whether a `/` opens a regex, so the scanner carries a
+ * short trailing window rather than re-reading everything it has emitted.
+ *
+ * `out.trimEnd()` looked correct and was quadratic twice over: it copied every byte stripped
+ * so far, and reading `out` at all flattens the rope that `out += ch` builds. A 1.3 MB source
+ * took 25 seconds — on a command that reads every file in the repository. The window is kept
+ * already right-trimmed, so it still sees past a blanked comment to the code before it.
+ */
 export function stripComments(src) {
   let out = ''
+  let tail = ''
+  const emit = s => {
+    out += s
+    tail = (tail + s).replace(/\s+$/, '').slice(-LOOKBEHIND)
+  }
   let i = 0
   while (i < src.length) {
     const ch = src[i]
     const next = src[i + 1]
 
     if (ch === '/' && next === '/') {
-      while (i < src.length && src[i] !== '\n') { out += ' '; i++ }
+      while (i < src.length && src[i] !== '\n') { emit(' '); i++ }
       continue
     }
     if (ch === '/' && next === '*') {
-      out += '  '
+      emit('  ')
       i += 2
       while (i < src.length && !(src[i] === '*' && src[i + 1] === '/')) {
-        out += src[i] === '\n' ? '\n' : ' '
+        emit(src[i] === '\n' ? '\n' : ' ')
         i += 1
       }
-      out += i < src.length ? '  ' : ''
+      emit(i < src.length ? '  ' : '')
       i += 2
       continue
     }
-    if (ch === '/' && startsRegex(out)) {
+    if (ch === '/' && startsRegex(tail)) {
       // Copy the literal verbatim: a quote or a `//` inside it is part of the pattern.
-      out += ch
+      emit(ch)
       i += 1
       let inClass = false
       while (i < src.length && src[i] !== '\n') {
         const c = src[i]
-        if (c === '\\') { out += c + (src[i + 1] ?? ''); i += 2; continue }
+        if (c === '\\') { emit(c + (src[i + 1] ?? '')); i += 2; continue }
         if (c === '[') inClass = true
         else if (c === ']') inClass = false
-        else if (c === '/' && !inClass) { out += c; i += 1; break }
-        out += c
+        else if (c === '/' && !inClass) { emit(c); i += 1; break }
+        emit(c)
         i += 1
       }
       continue
     }
     if (ch === '"' || ch === "'" || ch === '`') {
-      out += ch
+      emit(ch)
       i += 1
       while (i < src.length && src[i] !== ch) {
-        if (src[i] === '\\') { out += src[i] + (src[i + 1] ?? ''); i += 2; continue }
-        out += src[i]
+        if (src[i] === '\\') { emit(src[i] + (src[i + 1] ?? '')); i += 2; continue }
+        emit(src[i])
         i += 1
       }
-      out += src[i] ?? ''
+      emit(src[i] ?? '')
       i += 1
       continue
     }
-    out += ch
+    emit(ch)
     i += 1
   }
   return out
@@ -596,22 +610,36 @@ const languageOf = file => {
   return JS
 }
 
-/** file -> Set of files importing it */
-export function reverseGraph(files = walk()) {
+/**
+ * The import graph, both ways round, from one pass over the files.
+ *
+ * `rev` answers "who would this change break", which is the blast radius. `fwd` answers "what
+ * does this file pull in", which is what a check exercising an entry point actually reaches —
+ * and that was the question `coverage` had no way to ask, so it matched filenames against
+ * check text instead.
+ */
+export function importGraph(files = walk()) {
   const rev = new Map()
+  const fwd = new Map()
   for (const f of files) {
     let src
     try { src = readFileSync(f, 'utf8') } catch { scanProblems.add(f); continue }
-    const addEdge = (target, importer) => {
+    const addEdge = (target, importer, real = false) => {
       if (!target || target === importer) return
       if (!rev.has(target)) rev.set(target, new Set())
       rev.get(target).add(importer)
+      // Forward edges only for something that is actually there. The reverse side deliberately
+      // keys edges at paths a deleted module *would* have had; walking forward into those would
+      // claim a check reaches files the repository does not contain.
+      if (!real) return
+      if (!fwd.has(importer)) fwd.set(importer, new Set())
+      fwd.get(importer).add(target)
     }
 
     const lang = languageOf(f)
     for (const spec of lang.imports(src)) {
       const target = lang.resolve(spec, f)
-      if (target) { addEdge(target, f); continue }
+      if (target) { addEdge(target, f, true); continue }
 
       // Nothing is there now. That is exactly what a just-deleted module looks like, and
       // deleting one breaks every importer — the blast radius that matters most. Record the
@@ -628,7 +656,37 @@ export function reverseGraph(files = walk()) {
       if (pkg) addEdge(`${PKG}${pkg}`, f)
     }
   }
-  return rev
+  return { rev, fwd }
+}
+
+/** file -> Set of files importing it */
+export const reverseGraph = (files = walk()) => importGraph(files).rev
+
+/**
+ * Files reachable from `entries` by following imports, and which entry reached each.
+ *
+ * Bounded by the same `depth` the command uses, for the reason the whole section exists:
+ * claiming a check covers everything transitively behind it is over-claiming, and
+ * over-claiming hides a gap.
+ */
+export function reachedFrom(fwd, entries, depth = 1) {
+  const from = new Map()
+  let frontier = [...entries]
+  const seen = new Set(frontier)
+
+  for (let d = 0; d < depth && frontier.length; d++) {
+    const next = []
+    for (const f of frontier) {
+      for (const target of fwd.get(f) ?? []) {
+        if (seen.has(target)) continue
+        seen.add(target)
+        from.set(target, from.get(f) ?? f)
+        next.push(target)
+      }
+    }
+    frontier = next
+  }
+  return from
 }
 
 /** BFS outward from `seeds`; returns one sorted array per hop. */
@@ -708,8 +766,8 @@ const requestedPaths = c => {
   return out
 }
 
-export function coverage(checks, files) {
-  return files.map(file => {
+export function coverage(checks, files, reached = new Map()) {
+  const rows = files.map(file => {
     const stem = distinctive(file)
     const simpleStem = stem && /^[A-Za-z0-9]+$/.test(stem) ? stem.toLowerCase() : null
     // Every app-router file is called route.ts, so the filename says nothing about which
@@ -730,6 +788,19 @@ export function coverage(checks, files) {
 
     return { file, checks: names }
   })
+
+  // Second pass, after every direct match is known: a file nothing names, imported by a file
+  // something does. A check that exercises `/api/orders` exercises the module that route
+  // pulls in, and calling that "no check names this file" sent people looking for a gap that
+  // was already covered. Reported under its own tag, never folded into a direct match —
+  // over-claiming coverage hides a real gap, which is the direction that costs something.
+  const named = new Set(rows.filter(r => r.checks.length).map(r => r.file))
+  for (const row of rows) {
+    if (row.checks.length) continue
+    const entry = reached.get(row.file)
+    if (entry && named.has(entry)) row.via = entry
+  }
+  return rows
 }
 
 export function changed({ json = false, depth = 1, base = 'HEAD', specPath } = {}) {
@@ -763,7 +834,9 @@ export function changed({ json = false, depth = 1, base = 'HEAD', specPath } = {
   ])
   const unscannable = files.filter(f => !contributed.has(f))
 
-  const levels = seeds.length ? dependents(seeds, depth) : []
+  // One pass for both directions: `rev` is the blast radius, `fwd` is what a check reaches.
+  const graph = seeds.length ? importGraph() : { rev: new Map(), fwd: new Map() }
+  const levels = seeds.length ? dependents(seeds, depth, graph.rev) : []
   const radius = [...files, ...levels.flat()]
 
   // a broken contract is an error worth showing; only a missing one is "no spec yet"
@@ -780,10 +853,13 @@ export function changed({ json = false, depth = 1, base = 'HEAD', specPath } = {
     else if (e.code !== 'ENOSPEC') throw e
   }
 
-  const cov = checks ? coverage(checks, radius) : null
+  // Reached from whatever a check names directly, one pass first so `coverage` can ask.
+  const namedDirectly = checks ? coverage(checks, radius).filter(c => c.checks.length).map(c => c.file) : []
+  const cov = checks ? coverage(checks, radius, reachedFrom(graph.fwd, namedDirectly, depth)) : null
   // A test file that no check names is not a gap: the file is the verification. Warning
   // about it is the noise that teaches people to skip this section.
-  const uncovered = cov?.filter(c => !c.checks.length && !isTestFile(c.file)).map(c => c.file) ?? []
+  const uncovered = cov?.filter(c => !c.checks.length && !c.via && !isTestFile(c.file)).map(c => c.file) ?? []
+  const reached = cov?.filter(c => c.via).map(c => ({ file: c.file, via: c.via })) ?? []
 
   const warnings = scanWarnings()
 
@@ -822,6 +898,7 @@ export function changed({ json = false, depth = 1, base = 'HEAD', specPath } = {
     unscannable,
     dependents: levels,
     uncovered,
+    reached,
     tests_changed: movedTests,
     contract_changed: contract && !contract.unparseable
       ? { removed: contract.removed, added: contract.added, modified: contract.modified, goal: contract.goal }
@@ -909,16 +986,23 @@ function printHuman(o, depth) {
     return `${shown.join(', ')}${shown.length ? ', ' : ''}+${names.length - shown.length} more`
   }
 
-  for (const { file, checks } of o.coverage) {
-    const tag = checks.length ? 'OK  ' : isTestFile(file) ? 'TEST' : 'WARN'
+  for (const { file, checks, via } of o.coverage) {
+    const tag = checks.length ? 'OK  ' : via ? 'VIA ' : isTestFile(file) ? 'TEST' : 'WARN'
     const prefix = `  ${tag}  ${file} — `
     const body = checks.length
       ? summarise(checks, TERMINAL_WIDTH - prefix.length)
-      : isTestFile(file)
-        ? 'a test, so it verifies rather than needs verifying'
-        : 'no check names this file'
+      : via
+        ? `imported by ${via}, which a check names`
+        : isTestFile(file)
+          ? 'a test, so it verifies rather than needs verifying'
+          : 'no check names this file'
     console.log(ellipsize(prefix + body, TERMINAL_WIDTH))
   }
   if (o.uncovered.length) console.log(`\n${o.uncovered.length} file(s) in the blast radius have no check naming them.`)
+  // Said separately: reached is weaker than named. A check that exercises the importer runs
+  // this code, which is not the same as asserting anything about what it does.
+  if (o.reached?.length) {
+    console.log(`${o.reached.length} more are reached through one that is, rather than named directly.`)
+  }
   console.log()
 }

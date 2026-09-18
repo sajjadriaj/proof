@@ -1,5 +1,10 @@
 node_modules/
-# evidence bundles are per-machine artifacts; the contract itself is committed
+*.tgz
+
+# evidence bundles and scratch files are per-machine artifacts; the contract itself is committed
 .proof/runs/
 .proof/feedback.md
-*.tgz
+.proof/hook-state.json
+.proof/spec.lock
+.proof/*.tmp
+.proof/*.bak

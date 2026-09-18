@@ -2,7 +2,7 @@ import { readFileSync, writeFileSync, readdirSync, existsSync, statSync, rmSync 
 import { join, basename, relative } from 'node:path'
 import { PROOF_DIR, writeError } from './spec.js'
 import { RUNS, dirSize, humanBytes, missingRunFields } from './runs.js'
-import { VERDICT } from './check.js'
+import { VERDICT, STATUS_TAG } from './check.js'
 import { fingerprint } from './git.js'
 import { TERMINAL_WIDTH, truncateToWidth } from './terminal.js'
 
@@ -207,16 +207,27 @@ export function markdown(r) {
   p(`| Check | Asserted | Result | Time |`)
   p(`| --- | --- | --- | --- |`)
   for (const c of r.results) {
-    p(`| ${cell(c.name)} | ${cell(c.asserted ?? c.kind)} | ${c.status === 'passed' ? 'PASS' : 'FAIL'} | ${dur(c.ms)} |`)
+    p(`| ${cell(c.name)} | ${cell(c.asserted ?? c.kind)} | ${STATUS_TAG[c.status] ?? 'FAIL'} | ${dur(c.ms)} |`)
   }
 
   // contract checks that were selected but never got to run — synthetic serve checks
   // are not contract checks and must not be counted on either side
-  const skipped = (r.selected_checks ?? 0) - (r.ran_checks ?? 0)
-  if (skipped > 0) {
+  // Deliberate skips are not checks the run lost; they are checks the contract switched off,
+  // and folding them in here reported a halted run that never happened.
+  const halted = (r.selected_checks ?? 0) - (r.ran_checks ?? 0) - (r.skipped?.length ?? 0)
+  if (halted > 0) {
     p(``)
     // not always "never booted" — a port already in use stops the run before starting anything
-    p(`_${skipped} check(s) never ran — the run stopped when the serve check failed._`)
+    p(`_${halted} check(s) never ran — the run stopped when the serve check failed._`)
+  }
+
+  if (r.skipped?.length) {
+    p(``)
+    p(`## Skipped`)
+    p(``)
+    p(`These are switched off in the contract, so this run cannot report completion.`)
+    p(``)
+    for (const sk of r.skipped) p(`- **${cell(sk.check)}** — ${cell(sk.reason)}`)
   }
 
   if (r.failures.length) {
@@ -268,6 +279,69 @@ export function markdown(r) {
   }
   p(``)
   return out.join('\n')
+}
+
+/**
+ * The run as JUnit XML, which is the one report format every CI already renders.
+ *
+ * Nothing here is a new renderer for a format proof invented: a verdict that lives only in a
+ * terminal is a verdict nobody sees on the pull request, and every CI on earth will annotate
+ * a failure from this file. `proof check` still owns the verdict; this is the same run, said
+ * in the vocabulary the surrounding tooling speaks.
+ */
+export function junit(r) {
+  // XML 1.0 cannot carry most control characters at all, and program output is full of them —
+  // an ANSI escape in a build log made the whole file unparseable, which reads as "no results"
+  // rather than as an encoding problem.
+  const text = s => String(s ?? '')
+    // eslint-disable-next-line no-control-regex
+    .replace(/[ --]/g, '')
+    .replace(/[<>&"']/g, c => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;', "'": '&apos;' }[c]))
+
+  const failures = r.results.filter(c => c.status === 'failed').length
+  const skipped = r.results.filter(c => c.status === 'skipped').length
+  const seconds = ms => (Number(ms ?? 0) / 1000).toFixed(3)
+  const total = r.results.reduce((n, c) => n + Number(c.ms ?? 0), 0)
+
+  const body = r.results.map(c => {
+    const open = `  <testcase name="${text(c.name)}" classname="proof.${text(c.kind)}" time="${seconds(c.ms)}">`
+    if (c.status === 'skipped') return `${open}\n    <skipped message="${text(c.observed)}"/>\n  </testcase>`
+    if (c.status !== 'failed') {
+      // The assertion, not just the name: a green report that does not say what it proved is
+      // the same empty reassurance everywhere else in this tool refuses to give.
+      return `${open}\n    <system-out>${text(c.asserted ?? '')}</system-out>\n  </testcase>`
+    }
+    const f = r.failures.find(x => x.check === c.name) ?? {}
+    const detail = [
+      c.asserted ? `asserted: ${c.asserted}` : null,
+      f.expected ? `expected: ${f.expected}` : null,
+      `observed: ${f.observed ?? c.observed ?? ''}`,
+      f.evidence?.length ? `evidence: ${f.evidence.join(', ')}` : null,
+      f.output ? `\n${f.output}` : null,
+    ].filter(Boolean).join('\n')
+    return `${open}\n    <failure message="${text(f.expected ?? c.expected ?? 'check failed')}">${text(detail)}</failure>\n  </testcase>`
+  }).join('\n')
+
+  // The caveats travel with it. A CI report that drops "this run cannot claim completion" is
+  // the one place the claim gets read as stronger than it is.
+  const notes = [
+    r.status === 'partial' ? 'INCOMPLETE — this run makes no completion claim' : null,
+    r.stale ? 'STALE — the working tree has changed since this run' : null,
+    r.advisory,
+    ...(r.warnings ?? []),
+  ].filter(Boolean)
+
+  return [
+    '<?xml version="1.0" encoding="UTF-8"?>',
+    `<testsuites name="proof" tests="${r.results.length}" failures="${failures}" skipped="${skipped}" time="${seconds(total)}">`,
+    `<testsuite name="${text(r.goal ?? 'proof')}" tests="${r.results.length}" failures="${failures}"`
+      + ` skipped="${skipped}" time="${seconds(total)}"${r.at ? ` timestamp="${text(r.at)}"` : ''}>`,
+    ...(notes.length ? [`  <properties>\n${notes.map((n, i) => `    <property name="note.${i}" value="${text(n)}"/>`).join('\n')}\n  </properties>`] : []),
+    body,
+    '</testsuite>',
+    '</testsuites>',
+    '',
+  ].filter(l => l !== '').join('\n')
 }
 
 /**
@@ -371,7 +445,7 @@ function printRunList(json, all) {
   return 0
 }
 
-export function report({ json = false, run, list = false, all = false } = {}) {
+export function report({ json = false, run, list = false, all = false, junit: asJunit = false } = {}) {
   if (list) return printRunList(json, all)
 
   const dir = resolveRun(run)
@@ -418,6 +492,13 @@ export function report({ json = false, run, list = false, all = false } = {}) {
 
   if (json) {
     console.log(JSON.stringify(result, null, 2))
+    return code
+  }
+
+  // Straight to stdout, unsaved: this is piped into a file the CI already knows how to read,
+  // and writing a second copy beside the run would be a file nothing looks at.
+  if (asJunit) {
+    console.log(junit(result))
     return code
   }
 

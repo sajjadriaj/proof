@@ -1,0 +1,67 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['20', '22', '24']
+    steps:
+      - uses: actions/checkout@v4
+        # The suite compares a branch against its fork point, so a shallow clone would
+        # measure against the tip of main and attribute main's later commits to the branch.
+        with: {fetch-depth: 0}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - run: npm ci
+
+      # The browser verb has its own tests, and the binaries are a separate download from
+      # the package. Without them those tests fail as a missing download, not a regression.
+      - run: npx playwright install --with-deps chromium
+
+      - run: npm test
+
+  contract:
+    # proof's own acceptance contract, run by proof: the exit codes, the refusals and the
+    # machine-readable shape an agent depends on.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: {fetch-depth: 0}
+      - uses: actions/setup-node@v4
+        with: {node-version: '22', cache: npm}
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - run: node bin/proof.js check
+
+      # The contract has to fail on the code this branch started from, or it is not about this
+      # branch. Only on a pull request: on main there is no "before" to compare against.
+      - if: github.event_name == 'pull_request'
+        run: |
+          git fetch --no-tags --depth=0 origin "${{ github.base_ref }}"
+          node bin/proof.js falsify --base "origin/${{ github.base_ref }}"
+
+  windows:
+    # Visibility, not a gate. The runtime has a win32 branch for process teardown, but the
+    # fixtures the suite builds are POSIX shell, so what fails here is not yet separated from
+    # what is genuinely broken. Reported rather than asserted — claiming support proof has
+    # never run would be the one thing this tool exists not to do.
+    runs-on: windows-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with: {fetch-depth: 0}
+      - uses: actions/setup-node@v4
+        with: {node-version: '22', cache: npm}
+      - run: npm ci
+      - run: npm test
