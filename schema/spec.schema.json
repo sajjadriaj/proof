@@ -17,6 +17,305 @@
     "requirement": {
       "type": "string"
     },
+    "criteria": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[A-Za-z][A-Za-z0-9_.-]*$",
+            "description": "How checks refer to this criterion in `satisfies`, and how coverage reports it."
+          },
+          "requirement": {
+            "type": "string"
+          },
+          "source": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "type": {},
+                  "reference": {
+                    "type": "string"
+                  }
+                }
+              }
+            ],
+            "description": "Where this criterion came from — text, or {type, reference}."
+          },
+          "attack": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "surfaces": {
+                "type": "array",
+                "items": {
+                  "enum": [
+                    "input",
+                    "sequence",
+                    "concurrency"
+                  ]
+                },
+                "description": "Which strategies may run: input, sequence, concurrency."
+              },
+              "budget": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "duration": {
+                    "type": "number",
+                    "exclusiveMinimum": 0,
+                    "description": "Seconds one criterion's search may take."
+                  },
+                  "candidates": {
+                    "type": "number",
+                    "exclusiveMinimum": 0,
+                    "description": "How many scenarios one criterion's search may evaluate."
+                  },
+                  "concurrency": {
+                    "type": "number",
+                    "exclusiveMinimum": 0,
+                    "description": "The widest parallel step a concurrency attack builds."
+                  }
+                }
+              },
+              "permissions": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "network": {
+                    "enum": [
+                      "same-origin",
+                      "any"
+                    ]
+                  },
+                  "environment_mutation": {
+                    "type": "boolean"
+                  }
+                }
+              },
+              "setup": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "name": {
+                      "type": "string"
+                    },
+                    "http": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "properties": {
+                        "method": {
+                          "type": "string"
+                        },
+                        "path": {
+                          "type": "string"
+                        },
+                        "url": {
+                          "type": "string"
+                        },
+                        "headers": {
+                          "type": "object"
+                        },
+                        "body": {},
+                        "expect": {},
+                        "follow_redirects": {
+                          "type": "boolean"
+                        },
+                        "concurrent": {}
+                      }
+                    },
+                    "run": {
+                      "type": "string"
+                    },
+                    "capture": {
+                      "type": "object",
+                      "description": "Values later checks use as ${name}. Selectors: json.<path>, header.<name>, status, output, match:<regex>",
+                      "additionalProperties": {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      "propertyNames": {
+                        "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+                      }
+                    },
+                    "timeout": {
+                      "type": "number",
+                      "exclusiveMinimum": 0
+                    }
+                  }
+                }
+              },
+              "actions": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "name": {
+                      "type": "string"
+                    },
+                    "http": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "properties": {
+                        "method": {
+                          "type": "string"
+                        },
+                        "path": {
+                          "type": "string"
+                        },
+                        "url": {
+                          "type": "string"
+                        },
+                        "headers": {
+                          "type": "object"
+                        },
+                        "body": {},
+                        "expect": {},
+                        "follow_redirects": {
+                          "type": "boolean"
+                        },
+                        "concurrent": {}
+                      }
+                    },
+                    "run": {
+                      "type": "string"
+                    },
+                    "capture": {
+                      "type": "object",
+                      "description": "Values later checks use as ${name}. Selectors: json.<path>, header.<name>, status, output, match:<regex>",
+                      "additionalProperties": {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      "propertyNames": {
+                        "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+                      }
+                    },
+                    "timeout": {
+                      "type": "number",
+                      "exclusiveMinimum": 0
+                    }
+                  }
+                },
+                "description": "The operations an attack composes. Named, because invariants count them by name."
+              },
+              "invariants": {
+                "type": "array",
+                "minItems": 1,
+                "description": "What must remain true — one comparison each, like `successful_redeem <= 1`.",
+                "items": {
+                  "anyOf": [
+                    {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "expression": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "expression"
+                      ]
+                    }
+                  ]
+                }
+              }
+            },
+            "required": [
+              "actions",
+              "invariants"
+            ],
+            "description": "What `proof attack` may manipulate, and what must remain true while it does."
+          }
+        },
+        "required": [
+          "id",
+          "requirement"
+        ]
+      },
+      "description": "The statements this change has to satisfy. One with no check pointing at it makes a run INCOMPLETE."
+    },
+    "policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "How much evidence `proof done` requires before it will say DONE.",
+      "properties": {
+        "require_criteria_coverage": {
+          "type": "boolean"
+        },
+        "require_criteria_falsification": {
+          "type": "boolean"
+        },
+        "require_falsification": {
+          "type": "boolean"
+        },
+        "require_sealed_contract": {
+          "type": "boolean"
+        },
+        "require_challenges": {
+          "type": "boolean"
+        },
+        "allow_flakes": {
+          "type": "boolean"
+        },
+        "allow_skipped": {
+          "type": "boolean"
+        }
+      }
+    },
+    "challenges": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "apply": {
+            "type": "string",
+            "minLength": 1,
+            "description": "The command that introduces the fault, run against a throwaway copy of your code."
+          },
+          "breaks": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "minItems": 1
+              }
+            ],
+            "description": "The criteria this fault violates, so a detection can be attributed to a requirement."
+          }
+        },
+        "required": [
+          "name",
+          "apply"
+        ]
+      },
+      "description": "Faults `proof challenge` injects into a copy of your code. The contract has to fail on each."
+    },
     "serve": {
       "description": "The process, or processes in dependency order, to start before the checks.",
       "anyOf": [
@@ -111,6 +410,21 @@
         "properties": {
           "name": {
             "type": "string"
+          },
+          "satisfies": {
+            "description": "The criteria this check is evidence for. A criterion nothing satisfies is uncovered.",
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "minItems": 1
+              }
+            ]
           },
           "timeout": {
             "type": "number",

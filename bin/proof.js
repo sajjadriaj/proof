@@ -16,6 +16,11 @@ import { infer } from '../src/infer.js'
 import { lint } from '../src/lint.js'
 import { falsify } from '../src/falsify.js'
 import { hook } from '../src/hook.js'
+import { seal, diff } from '../src/seal.js'
+import { challenge } from '../src/challenge.js'
+import { attack, replay, parseBudget } from '../src/attack.js'
+import { promote } from '../src/counterexample.js'
+import { done } from '../src/done.js'
 
 const USAGE = `proof — verification CLI for AI coding agents
 
@@ -23,8 +28,15 @@ const USAGE = `proof — verification CLI for AI coding agents
   proof infer                  find verification gaps in the current diff
   proof changed                blast radius of the current diff vs its checks
   proof lint                   what the contract would prove, without running it
+  proof seal                   fingerprint the contract, so a later edit to it is visible
+  proof diff                   what the contract has changed since it was sealed
   proof falsify                run the contract against the code before your change — it must fail
   proof check                  execute the contract
+  proof challenge              inject faults into a copy of your code — the contract must catch them
+  proof attack [<criterion>]   search for a scenario where the contract passes and the claim does not
+  proof replay <id>            run a recorded counterexample again
+  proof promote <id>           turn a counterexample the contract missed into a check
+  proof done                   the completion gate: the whole verification chain, in one verdict
   proof report [run]           render the evidence for a run (default: latest)
   proof guard -- <agent...>    supervise an agent: rerun it until the contract passes
   proof hook                   Claude Code Stop hook: refuse to finish until the contract passes
@@ -44,11 +56,19 @@ const USAGE = `proof — verification CLI for AI coding agents
   --install     add the Stop hook to .claude/settings.json (hook)
   --print       show the settings snippet instead of installing it (hook)
   --max-attempts N  stop after N agent runs (guard: default until it passes; hook: default 5)
-  --spec PATH   contract path (init/check/changed/infer/guard/lint/hook/falsify)
+  --spec PATH   contract path (init/check/changed/infer/guard/lint/hook/falsify/seal/diff/challenge/attack/replay/promote/done)
   --depth N     import-graph hops to follow (changed/infer, default 1)
   --base REF    diff against REF instead of HEAD (changed/infer/falsify)
+  --from CMD    read candidates from a command that prints them as JSON (challenge/attack)
+  --budget T    how long one criterion's search may take, like 90s or 5m (attack)
+  --seed N      fix the search order, so a run can be repeated exactly (attack)
+  --strategy S  run one surface only: input, sequence or concurrency (attack)
 
 exit codes: 0 passed, 1 failed, 2 configuration error
+
+\`proof check\` reports what the contract did. \`proof done\` reports whether the
+evidence justifies calling the work finished — coverage, falsification,
+challenges and contract integrity — and exits non-zero unless the verdict is DONE.
 
 A --only run reports INCOMPLETE, never DONE: completion is a claim about the
 whole contract. Use it to iterate, then run a full \`proof check\`.
@@ -175,6 +195,35 @@ try {
       break
     case 'falsify':
       process.exitCode = falsify({ json, specPath: flags.spec, base: flags.base ?? 'HEAD' })
+      break
+    case 'seal':
+      process.exitCode = seal({ json, specPath: flags.spec })
+      break
+    case 'diff':
+      process.exitCode = diff({ json, specPath: flags.spec })
+      break
+    case 'challenge':
+      process.exitCode = challenge({ json, specPath: flags.spec, from: flags.from })
+      break
+    case 'attack':
+      process.exitCode = await attack({
+        json,
+        criterion: args[0],
+        budget: parseBudget(flags.budget),
+        seed: flags.seed === undefined ? undefined : positiveInt(flags.seed, 'seed', undefined),
+        strategy: flags.strategy,
+        from: flags.from,
+        specPath: flags.spec,
+      })
+      break
+    case 'replay':
+      process.exitCode = await replay({ json, id: args[0], specPath: flags.spec })
+      break
+    case 'promote':
+      process.exitCode = promote({ json, id: args[0], specPath: flags.spec })
+      break
+    case 'done':
+      process.exitCode = done({ json, specPath: flags.spec })
       break
     case 'hook':
       if (flags.install === true && flags.print === true) throw usage('--install and --print are alternatives — pick one')

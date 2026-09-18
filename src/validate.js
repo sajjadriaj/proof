@@ -1,6 +1,7 @@
 import { STEP_VERBS, slug } from './browser.js'
 import { TYPE_TOKENS } from './json-match.js'
 import { NAME_RE, SELECTORS, hasRef, referencedVars, selectorProblem } from './vars.js'
+import { invariantProblem } from './invariant.js'
 
 export const VERBS = ['run', 'http', 'file', 'env', 'browser']
 
@@ -63,6 +64,7 @@ export const serveBase = list => {
 
 export const PLACEHOLDER_RUN = new Map([
   ['echo "replace me with a real command"', '`proof init` wrote it because no build or test command was discovered'],
+  ['echo "TODO: assert the behaviour this fault broke"', '`proof promote` wrote it from a counterexample the contract accepted'],
   ['echo "TODO: your migrate command"', '`proof infer` wrote it because no migration tool was detected'],
   ['<your dev command>', '`proof init` scaffolded it because it could not tell how this project starts'],
 ])
@@ -78,9 +80,18 @@ export const isPlaceholderCommand = value => PLACEHOLDER_RUN.has(String(value).t
 // Anything not listed here is rejected — a key we silently ignore is an assertion
 // that never runs, and a check that asserts nothing must never report PASS.
 export const ALLOWED = {
-  '': ['goal', 'requirement', 'serve', 'checks'],
+  '': ['goal', 'requirement', 'criteria', 'policy', 'challenges', 'serve', 'checks'],
+  criterion: ['id', 'requirement', 'source', 'attack'],
+  'criterion.attack': ['surfaces', 'budget', 'permissions', 'setup', 'actions', 'invariants'],
+  'criterion.attack.budget': ['duration', 'candidates', 'concurrency'],
+  'criterion.attack.permissions': ['network', 'environment_mutation'],
+  action: ['name', 'http', 'run', 'capture', 'timeout'],
+  'criterion.source': ['type', 'reference'],
+  policy: ['require_criteria_coverage', 'require_criteria_falsification', 'require_falsification',
+    'require_sealed_contract', 'require_challenges', 'allow_flakes', 'allow_skipped'],
+  challenge: ['name', 'apply', 'breaks'],
   serve: ['name', 'run', 'ready_url', 'ready_log', 'url', 'timeout', 'log_must_not_match', 'reuse_existing'],
-  check: ['name', 'timeout', ...VERBS, 'expect_exit', 'expect_output', 'expect_under_ms', 'retry_for_ms', 'results', 'capture', 'skip', 'parallel'],
+  check: ['name', 'satisfies', 'timeout', ...VERBS, 'expect_exit', 'expect_output', 'expect_under_ms', 'retry_for_ms', 'results', 'capture', 'skip', 'parallel'],
   'check.http': ['method', 'path', 'url', 'headers', 'body', 'expect', 'follow_redirects', 'concurrent'],
   'check.http.expect': ['status', 'statuses', 'headers', 'body_contains', 'body_not_contains', 'json'],
   'check.file': ['path', 'exists', 'contains', 'not_contains'],
@@ -321,6 +332,14 @@ const KEY_HOMES = Object.entries(ALLOWED).reduce((index, [path, keys]) => {
  */
 const PLACE = {
   '': 'the top level',
+  criterion: 'an acceptance criterion',
+  'criterion.attack': '`attack` on a criterion',
+  'criterion.attack.budget': '`budget` on an attack block',
+  'criterion.attack.permissions': '`permissions` on an attack block',
+  action: 'an attack action',
+  'criterion.source': '`source` on a criterion',
+  policy: '`policy`',
+  challenge: 'a challenge',
   serve: '`serve`',
   check: 'a check',
   'check.http': '`http`',
@@ -364,6 +383,8 @@ export function validateSpec(spec) {
   if (!isPlain(spec)) return ['spec must be a YAML mapping']
 
   walk(spec, '', 'spec', problems)
+  validateCriteria(spec, problems)
+  validatePolicy(spec, problems)
 
   if (spec.serve !== undefined) {
     const asList = Array.isArray(spec.serve)
@@ -650,8 +671,275 @@ export function validateSpec(spec) {
 
   fillNeedsBase(needsBase, hasServe, problems)
   validateReferences(spec.checks, problems)
+  validateSatisfies(spec, problems)
+  validateChallenges(spec, problems)
 
   return problems
+}
+
+/** A criterion id has to be spellable in a `satisfies` list and readable in a verdict. */
+const CRITERION_ID = /^[A-Za-z][A-Za-z0-9_.-]*$/
+
+/**
+ * The criteria a contract declares, and the ids the checks will point at.
+ *
+ * Validated before anything else reads them because every later answer is keyed by id: a
+ * duplicate id makes two requirements share one row of coverage, and an id with a space in it
+ * cannot be written in a `satisfies` list without quoting that nobody will guess at.
+ */
+export function validateCriteria(spec, problems) {
+  if (spec.criteria === undefined) return
+  if (!Array.isArray(spec.criteria)) {
+    return problems.push('spec › criteria: must be a list of acceptance criteria — `- {id: AC1, requirement: "..."}`')
+  }
+  if (!spec.criteria.length) {
+    return problems.push('spec › criteria: is an empty list — give it the criteria this change has to satisfy, or remove it')
+  }
+
+  const seen = new Map()
+  spec.criteria.forEach((c, i) => {
+    const at = `spec › criteria[${i}]`
+    if (!isPlain(c)) return problems.push(`${at}: must be a mapping with an \`id\` and a \`requirement\``)
+    walk(c, 'criterion', at, problems)
+
+    if (typeof c.id !== 'string' || !c.id.trim()) {
+      problems.push(`${at} › id: needs an id checks can point at — \`AC1\`, \`token-expiry\``)
+    } else if (!CRITERION_ID.test(c.id)) {
+      problems.push(`${at} › id: "${c.id}" — letters, digits, dot, dash and underscore, starting with a letter`)
+    } else if (seen.has(c.id)) {
+      problems.push(`${at} › id: duplicate criterion id (also criteria[${seen.get(c.id)}]) — an id identifies`
+        + ' one requirement in coverage, in the manifest and in `satisfies`')
+    } else seen.set(c.id, i)
+
+    if (typeof c.requirement !== 'string' || !c.requirement.trim()) {
+      problems.push(`${at} › requirement: needs the requirement in words — it is what the coverage report reads back`)
+    }
+    if (c.source !== undefined && typeof c.source !== 'string' && !isPlain(c.source)) {
+      problems.push(`${at} › source: must be text, or \`{type, reference}\` — where this criterion came from`)
+    }
+    if (isPlain(c.source) && c.source.reference === undefined) {
+      problems.push(`${at} › source: needs a \`reference\` — the issue, ticket or document it came from`)
+    }
+    validateAttack(c.attack, `${at} › attack`, problems)
+  })
+
+}
+
+/** How much evidence `proof done` requires. Every key is a yes or a no; nothing else fits. */
+function validatePolicy(spec, problems) {
+  if (spec.policy === undefined) return
+  if (!isPlain(spec.policy)) {
+    return problems.push('spec › policy: must be a mapping of requirement to true or false')
+  }
+  for (const [key, value] of Object.entries(spec.policy)) {
+    mustBe(value, 'boolean', `spec › policy › ${key}`, problems)
+  }
+}
+
+/** The surfaces the engine can drive. Named here so a refusal can list them. */
+export const ATTACK_SURFACES = ['input', 'sequence', 'concurrency']
+
+/** Surfaces the design has a place for and the engine does not drive yet. Refused, not ignored. */
+const UNIMPLEMENTED_SURFACES = {
+  state: 'manipulating stored state needs a way to describe that state, which this contract language does not have yet',
+  identity: 'attacking as another identity needs the contract to say who the identities are',
+  environment: 'environment mutation is opt-in by design and not implemented',
+}
+
+/**
+ * What an attack may manipulate, and what must stay true while it does.
+ *
+ * Validated as strictly as a check, for the same reason: an attack action proof silently
+ * ignores is a scenario nobody ran, reported beside scenarios that did run. The one rule worth
+ * stating out loud is that actions carry no `expect` — an attack has no expectations, only
+ * observations, and the assertion lives in the invariant where both oracles can read it.
+ */
+function validateAttack(attack, at, problems) {
+  if (attack === undefined) return
+  if (!isPlain(attack)) return problems.push(`${at}: must be a mapping — \`{actions, invariants}\` at least`)
+  walk(attack, 'criterion.attack', at, problems)
+
+  const actions = attack.actions
+  if (!Array.isArray(actions) || !actions.length) {
+    problems.push(`${at} › actions: needs the operations an attack may compose — a list of`
+      + ' `{name, http}` or `{name, run}`')
+  }
+
+  const names = new Map()
+  for (const [i, list] of [['setup', attack.setup], ['actions', actions]]) {
+    if (list === undefined) continue
+    if (!Array.isArray(list)) { problems.push(`${at} › ${i}: must be a list of steps`); continue }
+
+    list.forEach((step, j) => {
+      const where = `${at} › ${i}[${j}]${isPlain(step) && step.name ? ` "${step.name}"` : ''}`
+      if (!isPlain(step)) return problems.push(`${where}: must be a mapping`)
+      walk(step, 'action', where, problems)
+
+      if (typeof step.name !== 'string' || !step.name.trim()) {
+        problems.push(`${where} › name: needs a name — invariants count steps by it (\`successful_<name>\`)`)
+      } else if (!NAME_RE.test(step.name)) {
+        problems.push(`${where} › name: "${step.name}" — letters, digits and underscores, not starting`
+          + ' with a digit: an invariant has to be able to name it')
+      } else if (names.has(step.name)) {
+        problems.push(`${where} › name: duplicate step name (also ${names.get(step.name)}) — a count`
+          + ' of `successful_' + step.name + '` would be about two different operations')
+      } else names.set(step.name, where)
+
+      const verbs = ['http', 'run'].filter(v => v in step)
+      if (verbs.length !== 1) {
+        problems.push(`${where}: needs exactly one of \`http\` or \`run\` — an attack composes requests`
+          + ' and commands, and those are the two it can observe')
+      }
+      if (isPlain(step.http)) {
+        if (!step.http.path && !step.http.url) problems.push(`${where} › http: needs a \`path\` or \`url\``)
+        if (step.http.expect !== undefined) {
+          problems.push(`${where} › http › expect: an attack action has no expectations — what must be`
+            + ' true goes in `invariants`, where the requirement oracle can read it')
+        }
+        mustBeRequestable(step.http.path, `${where} › http › path`, problems)
+      }
+      validateCapture(step.capture, verbs[0] ?? 'http', where, problems)
+    })
+  }
+
+  const invariants = attack.invariants
+  if (!Array.isArray(invariants) || !invariants.length) {
+    problems.push(`${at} › invariants: needs what must remain true — \`successful_redeem <= 1\`.`
+      + ' Without one there is nothing for an attack to violate, and no requirement oracle at all')
+  } else {
+    invariants.forEach((invariant, i) => {
+      const problem = invariantProblem(invariant, `${at} › invariants[${i}]`, [...names.keys()])
+      if (problem) problems.push(problem)
+    })
+  }
+
+  if (attack.surfaces !== undefined) {
+    if (!Array.isArray(attack.surfaces)) problems.push(`${at} › surfaces: must be a list`)
+    else {
+      for (const surface of attack.surfaces) {
+        if (ATTACK_SURFACES.includes(surface)) continue
+        const why = UNIMPLEMENTED_SURFACES[surface]
+        problems.push(`${at} › surfaces: ${why ? `\`${surface}\` is not something proof can drive yet — ${why}`
+          : `unknown surface "${surface}"`}. Available: ${ATTACK_SURFACES.join(', ')}`)
+      }
+    }
+  }
+
+  if (attack.budget !== undefined) {
+    if (!isPlain(attack.budget)) problems.push(`${at} › budget: must be a mapping of duration, candidates and concurrency`)
+    else {
+      for (const key of ['duration', 'candidates', 'concurrency']) {
+        mustBe(attack.budget[key], 'number', `${at} › budget › ${key}`, problems)
+        mustBePositive(attack.budget[key], `${at} › budget › ${key}`, problems)
+      }
+    }
+  }
+
+  if (isPlain(attack.permissions)) {
+    const network = attack.permissions.network
+    if (network !== undefined && !['same-origin', 'any'].includes(network)) {
+      problems.push(`${at} › permissions › network: \`same-origin\` (the default) or \`any\` — an attack`
+        + ' reaches the app this contract starts unless you say otherwise')
+    }
+    mustBe(attack.permissions.environment_mutation, 'boolean', `${at} › permissions › environment_mutation`, problems)
+    if (attack.permissions.environment_mutation === true) {
+      problems.push(`${at} › permissions › environment_mutation: proof cannot mutate the environment yet,`
+        + ' so granting it would permit something that does not happen')
+    }
+  }
+}
+
+/**
+ * `satisfies` on a check: which criterion this check is evidence for.
+ *
+ * An id nothing declares is the expensive typo: the criterion it was meant to cover stays
+ * uncovered, the run reports INCOMPLETE, and the contract looks like it says otherwise.
+ */
+function validateSatisfies(spec, problems) {
+  const declared = new Set(Array.isArray(spec.criteria)
+    ? spec.criteria.filter(isPlain).map(c => String(c.id))
+    : [])
+
+  spec.checks.forEach((c, i) => {
+    if (!isPlain(c) || c.satisfies === undefined) return
+    const where = `check[${i}]${c?.name ? ` "${c.name}"` : ''}`
+
+    const ids = typeof c.satisfies === 'string' ? [c.satisfies] : c.satisfies
+    if (!Array.isArray(ids) || ids.some(id => typeof id !== 'string')) {
+      return problems.push(`${where} › satisfies: must be a criterion id, or a list of them — \`satisfies: [AC1]\``)
+    }
+    if (!ids.length) {
+      return problems.push(`${where} › satisfies: is empty, so this check is evidence for nothing — name the`
+        + ' criterion it proves, or drop the key')
+    }
+    if (!declared.size) {
+      return problems.push(`${where} › satisfies: the contract declares no \`criteria\`, so there is nothing`
+        + ' for this check to satisfy — add a `criteria:` list, or drop the key')
+    }
+    for (const id of ids) {
+      if (declared.has(id)) continue
+      const hint = suggest(id, [...declared])
+      problems.push(`${where} › satisfies: no criterion "${id}" is declared${hint ? ` — did you mean "${hint}"?` : ''}`)
+    }
+  })
+}
+
+/**
+ * One fault `proof challenge` injects, in the shape the runner needs.
+ *
+ * Shared with the `--from` generator, which is held to exactly these rules: a challenge from a
+ * program is not more trusted than one written in the file.
+ */
+export function challengeProblems(c, where) {
+  const problems = []
+  if (!isPlain(c)) return [`${where}: must be a mapping`]
+  if (typeof c.name !== 'string' || !c.name.trim()) problems.push(`${where}: needs a \`name\` — the fault, in words`)
+  if (typeof c.apply !== 'string' || !c.apply.trim()) {
+    problems.push(`${where} › apply: needs the command that introduces the fault, run against a throwaway`
+      + ' copy of your code')
+  }
+  const breaks = typeof c.breaks === 'string' ? [c.breaks] : c.breaks
+  if (breaks !== undefined && (!Array.isArray(breaks) || breaks.some(b => typeof b !== 'string'))) {
+    problems.push(`${where} › breaks: must be the criterion id(s) this fault violates`)
+  }
+  return problems
+}
+
+function validateChallenges(spec, problems) {
+  if (spec.challenges === undefined) return
+  if (!Array.isArray(spec.challenges)) {
+    return problems.push('spec › challenges: must be a list of faults the contract has to catch'
+      + ' — `- {name: "...", apply: "<command>", breaks: [AC1]}`')
+  }
+  if (!spec.challenges.length) {
+    return problems.push('spec › challenges: is an empty list — give it a fault to inject, or remove it')
+  }
+
+  const declared = new Set(Array.isArray(spec.criteria)
+    ? spec.criteria.filter(isPlain).map(c => String(c.id))
+    : [])
+  const seen = new Map()
+
+  spec.challenges.forEach((c, i) => {
+    const at = `spec › challenges[${i}]${isPlain(c) && c.name ? ` "${c.name}"` : ''}`
+    problems.push(...challengeProblems(c, at))
+    if (!isPlain(c)) return
+    walk(c, 'challenge', at, problems)
+
+    if (typeof c.name === 'string' && c.name.trim()) {
+      const key = slug(c.name)
+      if (seen.has(key)) {
+        problems.push(`${at} › name: duplicate challenge name (also challenges[${seen.get(key)}]) — names`
+          + ' identify a fault in the report and its counterexample file')
+      } else seen.set(key, i)
+    }
+    const breaks = typeof c.breaks === 'string' ? [c.breaks] : Array.isArray(c.breaks) ? c.breaks : []
+    for (const id of breaks) {
+      if (typeof id !== 'string' || declared.has(id)) continue
+      const hint = suggest(id, [...declared])
+      problems.push(`${at} › breaks: no criterion "${id}" is declared${hint ? ` — did you mean "${hint}"?` : ''}`)
+    }
+  })
 }
 
 /**

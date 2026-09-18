@@ -27,15 +27,47 @@ proof init "<the requirement, in the user's words>"
 Then edit `.proof/spec.yaml`. Read `docs/writing-a-contract.md` in the repository if it is there;
 its rules are the ones below.
 
+Write the requirement down as **criteria** — one per thing the change has to do — and point each
+check at the criterion it proves. The requirement is almost never one statement, and a contract
+made only of checks cannot say which parts of it are covered:
+
+```yaml
+criteria:
+  - id: AC1
+    requirement: a reset link is emailed
+    source: issue#143
+  - id: AC2
+    requirement: a reset token cannot be reused
+checks:
+  - name: a reset link is emailed
+    satisfies: [AC1]
+    http: {method: POST, path: /api/password-reset, body: {email: ada@example.com}, expect: {status: 200, json: {sent: true}}}
+```
+
+A criterion nothing points at makes every run `INCOMPLETE`, however green it is. That is the
+intended behaviour: passing checks are evidence for what the checks assert, not for what was
+asked for.
+
 **2 · Read it back.**
 
 ```bash
 proof lint
 ```
 
-This prints every check as the sentence it asserts, and tells you what a passing run would and
-would not prove. Fix anything that reads wrong. `UNFINISHED` means a placeholder is still in the
-file and `proof check` will refuse it.
+This prints every check as the sentence it asserts, which criteria are covered, and what a
+passing run would and would not prove. Fix anything that reads wrong. `UNCOVERED` means a
+criterion has no check pointing at it; `UNFINISHED` means a placeholder is still in the file and
+`proof check` will refuse it.
+
+**2b · Seal it, if the repository seals contracts.**
+
+```bash
+proof seal
+```
+
+This fingerprints the contract as reviewed. From then on, editing it is visible rather than
+silent: a run whose contract no longer matches reports `INCOMPLETE`, and `proof diff` says what
+moved. Seal before implementing, never after a failure.
 
 **3 · Confirm it fails without the change. This step is not optional.**
 
@@ -64,6 +96,41 @@ proof check
 Exit `0` passed, `1` failed, `2` the contract itself is wrong. On a failure, read `expected` and
 `observed` and the evidence path — do not guess. `proof check --only "<text>"` runs one check
 while iterating; it reports `INCOMPLETE`, never `DONE`, so finish with a full run.
+
+**6 · Challenge the contract, where the contract declares faults.**
+
+```bash
+proof challenge
+```
+
+Each declared fault is injected into a throwaway copy of your code and the contract is run
+against it. `DETECTED` is the contract doing its job. `MISSED` means the contract would accept
+that wrong implementation — it is kept as a counterexample, and `proof promote <id>` turns it
+into a check for you to finish. Your working tree is never touched.
+
+**6b · Attack the claim, where the criterion declares an attack surface.**
+
+```bash
+proof attack
+```
+
+This searches for a scenario that satisfies the contract and violates the claim — the same
+operation twice, several at once, a field that is empty or the wrong type. `VERIFICATION_GAP`
+means the contract passed while the claim was broken: fix the behaviour, then
+`proof promote <id>` so the contract can never miss it again. `NO_COUNTEREXAMPLE_FOUND` means
+the budget ran out, and is never evidence of correctness — do not report it as one.
+
+**7 · Ask the only question that matters.**
+
+```bash
+proof done
+```
+
+This is the completion gate, and it is what you report against. It evaluates the whole chain —
+coverage, the checks, falsification, challenges, contract integrity, and whether the evidence is
+about the code that is here now — and exits non-zero unless the verdict is `DONE`. Every reason
+it is not `DONE` is a sentence naming what is missing. `INVALID` means the chain cannot be
+trusted at all: evidence recorded against another commit or another contract.
 
 ## Rules for the contract itself
 
@@ -112,7 +179,13 @@ moment a check needs code it is a test — write the test and reach it with
 | --- | --- |
 | `DOES NOT DISCRIMINATE` | The contract does not test the change. Assert content, not status. |
 | `UNFINISHED` / placeholder | Replace the scaffolded command with a real one, or delete the check. |
-| `INCOMPLETE` | A `--only` subset or a `skip:` — neither can claim completion. Run the full contract. |
+| `INCOMPLETE` | A `--only` subset, a `skip:`, an uncovered criterion, or a contract edited after sealing — none of them can claim completion. |
+| `UNCOVERED` | A criterion has no check pointing at it. Add `satisfies:` to the check that proves it, or write that check. |
+| `INVALID` | The evidence is about another commit or another contract. Re-run `proof check` here. |
+| `MISSED` (challenge) | The contract accepted an injected fault. `proof promote <id>`, then write the assertion that catches it. |
+| `VERIFICATION_GAP` | A scenario satisfies the contract and violates the claim. The bug is real *and* the contract cannot see it — fix both. |
+| `CLAIM_VIOLATION` | A scenario violates the claim and the contract does catch it. Fix the code. |
+| `NO_COUNTEREXAMPLE_FOUND` | The search found nothing in its budget. Not correctness. Never report it as proof of anything. |
 | `still has the route pattern` | `/orders/:id` was generated from a route definition. Use `capture`, or a real value. |
 | `uses ${x}, which no check captures` | A typo, or a check ordered before the one that produces the value. |
 | `nothing asserts what the app returned` | The run passed and proves less than it looks. Add `body_contains` or `json`. |
@@ -127,7 +200,10 @@ moment a check needs code it is a test — write the test and reach it with
   and makes the run report `INCOMPLETE` instead of `DONE`.
 - **Do not add checks for things the ticket did not ask for.** A contract is about one
   requirement. Breadth belongs in the suite.
-- **Do not report the work as complete on anything but a full `proof check` exiting 0.**
+- **Do not report the work as complete on anything but `proof done` exiting 0.** A green
+  `proof check` is one link in the chain, not the verdict.
+- **Do not add a criterion the requirement did not state, and do not delete one you cannot
+  satisfy.** Both rewrite what was asked for. Say so to the user instead.
 
 ## Other commands
 
@@ -136,6 +212,10 @@ moment a check needs code it is a test — write the test and reach it with
 | `proof infer` | Routes, environment variables and migrations in the diff that nothing verifies; `--write` appends them as checks — then tighten each one to assert content |
 | `proof changed` | What the diff touches, what imports it, and which checks name each file |
 | `proof report` | The last run rendered as markdown, with evidence linked |
+| `proof diff` | What the contract has changed since it was sealed, and which criteria that leaves unverified |
+| `proof attack [<criterion>]` | Search for a scenario the contract accepts and the claim forbids; `--budget`, `--seed`, `--strategy` |
+| `proof replay <id>` | Run a recorded counterexample again — green once it stops reproducing |
+| `proof done --json` | The verification manifest, also written to `.proof/report.json` |
 | `proof check --json` | The verdict as `{status, checks, failures: [{check, expected, observed, evidence, was, since}]}` |
 
 `was: "passed"` on a failure means the change broke something that used to work. Treat that

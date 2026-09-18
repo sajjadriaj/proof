@@ -3,6 +3,8 @@ import { constants } from 'node:os'
 import { mkdirSync, writeFileSync, existsSync, readFileSync, readdirSync, statSync, openSync, readSync, closeSync } from 'node:fs'
 import { join } from 'node:path'
 import { loadSpec, PROOF_DIR, SPEC_PATH, writeFileAtomic, writeError, contractChange, CONTRACT_CHANGED_NOTICE } from './spec.js'
+import { coverage, fillUncoveredNotice, satisfied, uncovered } from './criteria.js'
+import { fillModifiedNotice, integrity } from './seal.js'
 import { placeholderChecks, serveList, serveLabel, serveCheckName, serveBase } from './validate.js'
 import { evidenceGrowth, RUNS, recentResults, FLAKE_WINDOW, flakiness, fillFlakyNotice } from './runs.js'
 import { context as gitContext, fingerprint, inRepo } from './git.js'
@@ -768,7 +770,9 @@ export const ADVISORY = {
     + '`expect: {json: ...}` to the checks that carry the requirement.',
 }
 
-const RUNNERS = { run: runShell, http: runHttp, file: runFile, env: runEnv, browser: runBrowser }
+// Exported for `attack`, which composes the same verbs into scenarios rather than into a
+// contract. One implementation of "what a check does", whoever is asking.
+export const RUNNERS = { run: runShell, http: runHttp, file: runFile, env: runEnv, browser: runBrowser }
 
 const responds = async url => {
   try {
@@ -813,7 +817,7 @@ const serveWarnings = (server, serve) => {
   return out.length ? out : undefined
 }
 
-async function boot(serve) {
+export async function boot(serve) {
   const url = serve.ready_url ?? serve.url
   const pattern = serve.ready_log ? new RegExp(serve.ready_log, 'i') : null
   if (!url && !pattern) throw new Error('serve needs a ready_url or a ready_log')
@@ -1093,7 +1097,15 @@ async function runOne({ check: c, index }, ctx, vars, producedBy) {
   // Quarantined on purpose. Recorded as a check with a reason rather than removed, and the
   // run reports INCOMPLETE for it — a contract with a check switched off has not been proved.
   if (c.skip !== undefined) {
-    return { name, kind, asserted: describe(c, kind), status: 'skipped', observed: c.skip, ms: 0 }
+    return {
+      name,
+      kind,
+      asserted: describe(c, kind),
+      ...(satisfied(c).length ? { criteria: satisfied(c) } : {}),
+      status: 'skipped',
+      observed: c.skip,
+      ms: 0,
+    }
   }
 
   // Same split as the validator: a shell command keeps whatever proof did not capture, so
@@ -1172,6 +1184,9 @@ async function runOne({ check: c, index }, ctx, vars, producedBy) {
     name,
     kind,
     asserted: describe(filled, kind) + (c.retry_for_ms ? `, retried for up to ${c.retry_for_ms}ms` : ''),
+    // Which criteria this check is evidence for, carried on the result rather than looked up
+    // from the contract later: the contract moves, and a run has to be readable without it.
+    ...(satisfied(c).length ? { criteria: satisfied(c) } : {}),
     ...r,
     ...(captured.length ? { captured } : {}),
     ms,
@@ -1368,11 +1383,22 @@ export async function check({ json = false, specPath, only, baseUrl: baseUrlOver
 
   const serveSkipped = serves.length > 0 && !needsApp
   const failures = results.filter(r => r.status === 'failed')
+
+  // Requirement coverage. A check passing is evidence for whatever that check asserts; a
+  // criterion with nothing pointing at it has no evidence at all, however green the run is.
+  const criteria = coverage(spec, results)
+  const uncoveredIds = uncovered(criteria)
+  // Which contract produced this verdict, and whether it is still the one that was sealed.
+  const seal = integrity(spec, specPath ?? SPEC_PATH)
   // Checks the contract itself switched off. A completion verdict is a claim about the whole
   // contract, so one of these withholds it exactly as a subset run does — the difference is
   // that the reason is written in the file and travels with the diff.
   const skipped = results.filter(r => r.status === 'skipped').map(r => ({ check: r.name, reason: r.observed }))
-  const incomplete = partial || skipped.length > 0
+  // Three ways a green run still makes no completion claim: it ran part of the contract, the
+  // contract switched a check off, or a criterion has no evidence in it at all. A fourth when
+  // the contract was sealed and has moved since — the evidence is about a definition of "done"
+  // nobody has reviewed.
+  const incomplete = partial || skipped.length > 0 || uncoveredIds.length > 0 || seal.status === 'modified'
   // Evidence proof already had and never read: every run of this contract is on disk, and the
   // only one ever consulted was the last. A check that passes four runs in five rendered
   // exactly like one that always passes.
@@ -1402,6 +1428,11 @@ export async function check({ json = false, specPath, only, baseUrl: baseUrlOver
     serve_skipped: serveSkipped,
     // Checks switched off in the contract, each with the reason written beside it.
     skipped,
+    // Each declared criterion, the checks that carry it, and what this run says about them.
+    criteria,
+    // The contract this verdict is about, by content, and whether that is the sealed one.
+    contract_hash: seal.hash,
+    contract_integrity: seal.status,
     // Checks whose recent history holds both outcomes for the same assertion.
     flaky,
     // The app this run was pointed at, when it was not one proof started.
@@ -1421,6 +1452,12 @@ export async function check({ json = false, specPath, only, baseUrl: baseUrlOver
       // A green run carrying one of these is the case worth interrupting: the verdict is the
       // thing being trusted, and it was arrived at by a check that does not always agree.
       ...flaky.map(fillFlakyNotice),
+      // A criterion nobody wrote a check for. The run is green and the requirement it names
+      // has no evidence in it — the gap this whole layer exists to make visible.
+      ...(uncoveredIds.length ? [fillUncoveredNotice(uncoveredIds)] : []),
+      // The contract moved after it was sealed, so this verdict is against expectations
+      // nobody has reviewed since.
+      ...(seal.status === 'modified' ? [fillModifiedNotice(seal)] : []),
       ...(skipped.length
         ? [`${skipped.length} check(s) are skipped in the contract (${skipped.map(s => `${s.check}: ${s.reason}`).join('; ')})`
           + ' — this run cannot report completion while they are']
@@ -1510,8 +1547,19 @@ const stripOutput = r => ({
 export const VERDICT = {
   passed: 'DONE',
   failed: 'NOT DONE',
-  partial: 'INCOMPLETE — selected checks passed; run `proof check` for a completion verdict',
+  partial: 'INCOMPLETE — this run does not make a completion claim',
 }
+
+/**
+ * The verdict line, with the reason a completion claim is being withheld.
+ *
+ * A subset run and a run with an uncovered criterion are both INCOMPLETE and have nothing else
+ * in common, and "selected checks passed" printed under a full run that covered nothing was an
+ * answer to a question nobody asked.
+ */
+export const verdictLine = r => (r.status === 'partial' && r.partial
+  ? 'INCOMPLETE — selected checks passed; run `proof check` for a completion verdict'
+  : VERDICT[r.status] ?? r.status)
 
 /** The tag in the CHECKS column. A skip is neither of the two things a verdict is made of. */
 export const STATUS_TAG = { passed: 'PASS', failed: 'FAIL', skipped: 'SKIP' }
@@ -1544,6 +1592,18 @@ function printHuman(r) {
     const skipped = r.serve_skipped ? ' The serve block was not started: nothing selected needs it.' : ''
     console.log(`\nSubset run: --only "${r.only}" selected ${r.selected_checks} of ${r.contract_checks} check(s).${skipped}`)
   }
+  // The requirement, check by check. Passing checks are evidence for what the checks assert;
+  // this is the column that says whether that adds up to what was asked for.
+  if (r.criteria?.length) {
+    const idWidth = columnWidth(r.criteria.map(c => c.id), 12)
+    const textWidth = columnWidth(r.criteria.map(c => c.requirement ?? ''), 48)
+    console.log('\nREQUIREMENT COVERAGE')
+    for (const c of r.criteria) {
+      console.log(`  ${padTo(truncateToWidth(c.id, 12), idWidth + 2)}`
+        + `${padTo(truncateToWidth(c.requirement ?? '', 48), textWidth + 2)}${c.status.toUpperCase()}`)
+    }
+  }
+
   if (r.skipped?.length) {
     console.log(`\nSKIPPED\n${r.skipped.map(s => `  ${s.check} — ${s.reason}`).join('\n')}`)
   }
@@ -1569,5 +1629,8 @@ function printHuman(r) {
 
   // On its own line: the INCOMPLETE verdict already carries a sentence, and appending to it
   // produced a run-on with two em-dashes.
-  console.log(`\nVERDICT\n  ${VERDICT[r.status]}\n  ${tally}\n`)
+  const covered = r.criteria?.length
+    ? `, ${r.criteria.filter(c => c.status === 'verified').length}/${r.criteria.length} criteria verified`
+    : ''
+  console.log(`\nVERDICT\n  ${verdictLine(r)}\n  ${tally}${covered}\n`)
 }

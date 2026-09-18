@@ -1,68 +1,44 @@
-// Does this contract actually test this change?
-//
-// Everything else here asks whether the code satisfies the contract. This asks the question
-// underneath it, which nothing was asking: would the contract have noticed if the change had
-// never been made? A check that passes on the code from before the diff is not verifying the
-// requirement — it is decoration, and it will report DONE for a branch that did nothing.
-//
-// The tool's own thesis, turned on itself. `proof check` says do not trust the agent; this
-// says do not trust the contract either. It is the acceptance-level version of watching a
-// test go red before you make it green, and it is mechanical rather than a judgement call:
-// check the base commit out somewhere else, run the current contract against it, and see.
-import { execFileSync, spawnSync } from 'node:child_process'
-import { existsSync, lstatSync, mkdtempSync, rmSync, symlinkSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { mkdirSync, readFileSync } from 'node:fs'
 import { join, resolve } from 'node:path'
-import { fileURLToPath } from 'node:url'
-import { loadSpec, SPEC_PATH } from './spec.js'
+import { contractKey, loadSpec, PROOF_DIR, SPEC_PATH, writeError, writeFileAtomic } from './spec.js'
 import { forkPoint, head, inRepo, resolveCommit, showPrefix, toplevel } from './git.js'
 import { serveList } from './validate.js'
+import { criteriaList, satisfied } from './criteria.js'
+import { contractHash } from './seal.js'
+import { isSuspicious, runContract, withWorktree } from './sandbox.js'
 import { block, columnWidth, padTo, truncateToWidth } from './terminal.js'
 
-const CLI = fileURLToPath(new URL('../bin/proof.js', import.meta.url))
 const NAME_COLUMN_MAX = 48
 
-// Same bound `guard` uses, for the same reason: the verdict arrives on one pipe.
-const VERDICT_BUFFER = 64 * 1024 * 1024
+/** Where the baseline lives, so `proof done` can ask whether falsification ever happened. */
+export const RECORD_PATH = join(PROOF_DIR, 'falsification.json')
 
-/**
- * Directories a project needs to run and does not commit.
- *
- * A checkout of the base commit has no `node_modules`, so the app would fail to boot and the
- * contract would "fail" — which is the answer this command is looking for, arrived at for a
- * reason that has nothing to do with the change. Linked rather than installed: `npm ci` for
- * the base commit would be correct and would also take minutes, and the run says out loud
- * that the dependencies are the working tree's.
- *
- * ponytail: top level only. A monorepo's per-package `node_modules` falls back to the
- * inconclusive verdict, which is the honest answer rather than a wrong one.
- */
-const DEP_DIRS = ['node_modules', '.venv', 'venv', 'vendor']
-
-const linkDeps = (from, to) => {
-  const linked = []
-  for (const name of DEP_DIRS) {
-    const source = join(from, name)
-    try {
-      if (!lstatSync(source).isDirectory()) continue
-      symlinkSync(source, join(to, name), process.platform === 'win32' ? 'junction' : 'dir')
-      linked.push(name)
-    } catch { /* absent, or already there in the checkout */ }
-  }
-  return linked
+export function readFalsification(specPath = SPEC_PATH) {
+  try {
+    const parsed = JSON.parse(readFileSync(RECORD_PATH, 'utf8'))
+    return parsed?.records?.[contractKey(specPath)] ?? null
+  } catch { return null }
 }
 
-const git = (...args) => execFileSync('git', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
-
 /**
- * A failure that says nothing about the change.
+ * The baseline run, kept.
  *
- * A crashed runner never reached the code. A command that exits 127 was not found, which on a
- * checkout missing a build step is the environment rather than the requirement. Counting
- * either as evidence would let a contract that tests nothing pass this command — the exact
- * false reassurance it exists to remove.
+ * Falsification is a stage in the lifecycle, not a thing you look at once: `proof done` has to
+ * be able to ask whether this contract was ever shown to fail without the change, and for
+ * which commit and which contract. A record that lives only in a terminal cannot answer that.
  */
-const isSuspicious = r => Boolean(r.crashed) || r.exit_code === 127
+function record(out, specPath) {
+  let existing = {}
+  try { existing = JSON.parse(readFileSync(RECORD_PATH, 'utf8')) ?? {} } catch {}
+  const next = { ...existing, version: 1, records: { ...(existing.records ?? {}), [contractKey(specPath)]: out } }
+  try {
+    mkdirSync(PROOF_DIR, { recursive: true })
+    writeFileAtomic(RECORD_PATH, `${JSON.stringify(next, null, 2)}\n`)
+  } catch (e) {
+    throw writeError(e, RECORD_PATH, 'the falsification record',
+      '`proof done` reads it to decide whether the contract was ever shown to fail without the change.')
+  }
+}
 
 export function falsify({ json = false, specPath, base = 'HEAD' } = {}) {
   if (!inRepo()) {
@@ -78,8 +54,6 @@ export function falsify({ json = false, specPath, base = 'HEAD' } = {}) {
       { code: 'ENOBASE' })
   }
 
-  // Read and validated here, before a worktree exists: a broken contract is the ordinary
-  // coded error, and finding it after checking out a commit would be a slower way to say it.
   const path = specPath ?? SPEC_PATH
   const spec = loadSpec(path)
   const absoluteSpec = resolve(path)
@@ -92,64 +66,48 @@ export function falsify({ json = false, specPath, base = 'HEAD' } = {}) {
 
   const root = toplevel()
   const prefix = showPrefix()
-  const worktree = mkdtempSync(join(tmpdir(), 'proof-falsify-'))
-  let linked = []
 
-  // Registered before the checkout exists: Ctrl-C between here and the finally would otherwise
-  // leave a registered worktree behind, and git refuses to reuse a path it still believes in.
-  const cleanup = () => {
-    try { git('worktree', 'remove', '--force', worktree) } catch { /* never added, or already gone */ }
-    try { rmSync(worktree, { recursive: true, force: true }) } catch {}
-    try { git('worktree', 'prune') } catch {}
-  }
-  const onSignal = () => { cleanup(); process.exit(130) }
-  process.on('SIGINT', onSignal)
-  process.on('SIGTERM', onSignal)
+  const { run, linked } = withWorktree(commit, root, (worktree, links) => ({
+    run: runContract(prefix ? join(worktree, prefix) : worktree, absoluteSpec, { label: commit.slice(0, 12) }),
+    linked: links,
+  }))
 
-  let run
-  try {
-    try {
-      git('worktree', 'add', '--detach', '--quiet', worktree, commit)
-    } catch (e) {
-      throw Object.assign(
-        new Error(`could not check out ${commit.slice(0, 12)} to compare against — ${String(e.stderr ?? e.message).trim().split('\n')[0]}`),
-        { code: 'EWORKTREE' })
-    }
-    linked = linkDeps(root, worktree)
+  const out = classify(run, { spec, specPath: path, base, from, commit, linked })
+  record(out, path)
 
-    // The current contract against the old code — the whole point. `--spec` is absolute, so
-    // the checkout's own copy of the contract (or its absence) is not what runs, while `run:`
-    // commands and `file:` paths still resolve inside the checkout.
-    const cwd = prefix ? join(worktree, prefix) : worktree
-    const r = spawnSync(process.execPath, [CLI, 'check', '--json', '--spec', absoluteSpec], {
-      cwd,
-      encoding: 'utf8',
-      maxBuffer: VERDICT_BUFFER,
-    })
-    if (r.error) {
-      throw Object.assign(new Error(`could not run the contract against ${commit.slice(0, 12)} — ${r.error.message}`), { code: 'EWORKTREE' })
-    }
-    try {
-      run = JSON.parse(r.stdout)
-    } catch {
-      throw Object.assign(
-        new Error(`the contract produced no verdict against ${commit.slice(0, 12)}:\n${(r.stdout + r.stderr).trim()}`),
-        { code: 'EBADSPEC' })
-    }
-    if (run.status === 'error') {
-      throw Object.assign(new Error(`the contract could not run against ${commit.slice(0, 12)} — ${run.error}`), { code: 'EBADSPEC' })
-    }
-  } finally {
-    process.off('SIGINT', onSignal)
-    process.off('SIGTERM', onSignal)
-    cleanup()
-  }
-
-  const out = classify(run, { spec, base, from, commit, linked })
   if (json) console.log(JSON.stringify(out, null, 2))
   else printHuman(out)
 
   return { discriminates: 0, inconclusive: 2 }[out.status] ?? 1
+}
+
+/**
+ * What each criterion's own checks did on the base commit.
+ *
+ * `falsified` is the answer the lifecycle wants: the requirement was not there before, and
+ * these checks are what notices. `already-satisfied` is the finding — the criterion's checks
+ * pass on code that predates the change, so they are not evidence for it. Some criteria are
+ * legitimately regression guards ("the login page still works"), which is why this is reported
+ * per criterion rather than folded into one pass/fail: only the author knows which is which.
+ */
+export function criteriaFalsification(spec, contractChecks) {
+  const status = new Map(contractChecks.map(r => [r.name, r]))
+
+  return criteriaList(spec).map(c => {
+    const id = String(c.id)
+    const names = (Array.isArray(spec.checks) ? spec.checks : [])
+      .filter(check => satisfied(check).includes(id))
+      .map(check => check?.name)
+      .filter(name => status.has(name))
+
+    if (!names.length) return { id, status: 'uncovered', checks: [] }
+
+    const rows = names.map(n => status.get(n))
+    const real = rows.filter(r => r.status === 'failed' && !isSuspicious(r))
+    if (real.length) return { id, status: 'falsified', checks: names }
+    if (rows.some(r => r.status === 'failed')) return { id, status: 'inconclusive', checks: names }
+    return { id, status: 'already-satisfied', checks: names }
+  })
 }
 
 /**
@@ -159,7 +117,7 @@ export function falsify({ json = false, specPath, base = 'HEAD' } = {}) {
  * commit has proved nothing about itself, and reporting that as "it discriminates" would be
  * the same false confidence every other part of this tool refuses to give.
  */
-export function classify(run, { spec, base, from, commit, linked = [] }) {
+export function classify(run, { spec, specPath = SPEC_PATH, base, from, commit, linked = [] }) {
   const results = run.results ?? []
   const contractChecks = results.filter(r => r.kind !== 'serve' && r.status !== 'skipped')
   const serveFailed = results.filter(r => r.kind === 'serve' && r.status === 'failed')
@@ -171,23 +129,30 @@ export function classify(run, { spec, base, from, commit, linked = [] }) {
   const checks = contractChecks.map(r => ({
     check: r.name,
     status: r.status,
-    // The whole finding, per row: this one needed the change, that one did not.
     about_the_change: r.status === 'failed' && !isSuspicious(r),
     observed: r.observed ?? null,
   }))
 
+  const criteria = criteriaFalsification(spec, contractChecks)
+
   const base_ran = serveFailed.length === 0
   const common = {
+    at: new Date().toISOString(),
+    spec: specPath,
+    contract_hash: contractHash(spec),
     base,
     from,
     commit,
     goal: spec.goal ?? null,
     checks,
+    criteria,
+    // Criteria whose checks all pass on code that predates the change. Named separately
+    // because this is the finding of §5: a check that already passes is not testing the change.
+    criteria_not_falsified: criteria.filter(c => c.status === 'already-satisfied').map(c => c.id),
     discriminating: evidence.map(r => r.name),
     regression_guards: contractChecks.filter(r => r.status === 'passed').map(r => r.name),
     suspicious: suspicious.map(r => ({ check: r.name, observed: r.observed ?? null })),
     linked_dependencies: linked,
-    // Checks reaching a process proof did not start would have been talking to the new code.
     reused_existing: serveList(spec).some(s => s?.reuse_existing === true),
   }
 
@@ -229,6 +194,14 @@ const VERDICT = {
   inconclusive: 'INCONCLUSIVE',
 }
 
+/** What each criterion's row means, in the two words a reader needs. */
+const CRITERION_MEANING = {
+  falsified: 'FAIL  needs your change',
+  'already-satisfied': 'PASS  already true before your change',
+  uncovered: '····  no check carries it',
+  inconclusive: 'FAIL  failed for a reason that is not your change',
+}
+
 function printHuman(o) {
   console.log('\nFALSIFY')
   if (o.goal) console.log(`\nRequirement:\n${block(o.goal, '  ')}`)
@@ -236,6 +209,14 @@ function printHuman(o) {
     + `${o.base === 'HEAD' ? ', the last commit' : `, where this branch left ${o.base}`}`
     + ' — the code as it was before your change. Every check that carries the requirement has'
     + ' to fail there, or it is not testing it.', '  ')}`)
+
+  if (o.criteria.length) {
+    const w = columnWidth(o.criteria.map(c => c.id), NAME_COLUMN_MAX)
+    console.log('\nCRITERIA AGAINST THE BASE')
+    for (const c of o.criteria) {
+      console.log(`  ${padTo(truncateToWidth(c.id, NAME_COLUMN_MAX), w + 2)}${CRITERION_MEANING[c.status]}`)
+    }
+  }
 
   if (o.checks.length) {
     const w = columnWidth(o.checks.map(c => c.check), NAME_COLUMN_MAX)
@@ -259,6 +240,11 @@ function printHuman(o) {
     notes.push('the contract sets `reuse_existing: true`, so these checks may have reached an app proof'
       + ' did not start — which would be the current code, not the base. Stop it and run this again.')
   }
+  if (o.criteria_not_falsified.length) {
+    notes.push(`${o.criteria_not_falsified.join(', ')} already hold on the base commit — the checks that`
+      + ' carry them pass without your change, so they are regression guards rather than evidence for it.'
+      + ' If one of them is the requirement, its checks are not testing it yet.')
+  }
   if (o.status === 'discriminates' && o.suspicious.length) {
     notes.push(`${o.suspicious.length} other check(s) failed for a reason that says nothing about the change`
       + ` (${o.suspicious.map(s => s.check).join(', ')}) — they were not counted as evidence.`)
@@ -270,8 +256,6 @@ function printHuman(o) {
     console.log(`\nVERDICT\n  ${verdict}`
       + `\n  ${o.discriminating.length} of ${o.checks.length} check(s) fail without your change, so the contract is about it`)
     if (o.regression_guards.length) {
-      // A mature contract has dozens of these, and naming every one pushed the line that
-      // matters off the screen. The count is the finding; the names are a sample of it.
       console.log(block(`${o.regression_guards.length} would pass either way`
         + ` (${sample(o.regression_guards)}) — regression guards, not the requirement`, '  '))
     }

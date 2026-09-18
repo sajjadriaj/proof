@@ -4,6 +4,8 @@ import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { loadSpec, PROOF_DIR } from './spec.js'
 import { placeholderChecks } from './validate.js'
+import { coverage, uncovered } from './criteria.js'
+import { integrity, shortHash } from './seal.js'
 import { TERMINAL_WIDTH, wrap } from './terminal.js'
 
 const CLI = fileURLToPath(new URL('../bin/proof.js', import.meta.url))
@@ -50,6 +52,30 @@ export async function guard({ command, maxAttempts = Infinity, specPath, json = 
         + ' — a run cannot report completion while they are, so every attempt would end without a'
         + ' completion verdict. Switch them back on, or remove them.'),
       { code: 'EUNFINISHED' })
+  }
+
+  // Same refusal, for the same reason: a criterion with no check pointing at it makes every run
+  // report INCOMPLETE, which guard never accepts as a pass — so the agent would be relaunched
+  // forever over a gap in the contract that no amount of code can close.
+  const gaps = uncovered(coverage(spec))
+  if (gaps.length) {
+    throw Object.assign(
+      new Error(`${gaps.length} acceptance criterion/criteria have no check pointing at them`
+        + ` (${gaps.join(', ')}) — no run can report completion while that is true, so every attempt`
+        + ' would end without a completion verdict. Add `satisfies:` to the check that proves each one.'),
+      { code: 'EUNCOVERED' })
+  }
+
+  // And the third wall of the same shape: a contract that has moved since it was sealed makes
+  // every run INCOMPLETE until someone reviews the change. That someone is not the agent being
+  // supervised — it is the reason the seal exists.
+  const seal = integrity(spec, specPath)
+  if (seal.status === 'modified') {
+    throw Object.assign(
+      new Error(`the contract has changed since it was sealed (sealed ${shortHash(seal.sealed)},`
+        + ` now ${shortHash(seal.hash)}), so no run can report completion until the change is`
+        + ' reviewed. `proof diff` shows what moved; `proof seal` accepts it.'),
+      { code: 'EMODIFIED' })
   }
 
   const say = line => console.log(wrap(line, TERMINAL_WIDTH).join('\n'))

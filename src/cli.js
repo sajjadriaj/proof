@@ -9,6 +9,13 @@ export const COMMAND_FLAGS = {
   infer: ['write', 'depth', 'base', 'spec'],
   changed: ['depth', 'base', 'spec'],
   check: ['only', 'spec', 'base-url'],
+  seal: ['spec'],
+  diff: ['spec'],
+  challenge: ['spec', 'from'],
+  attack: ['spec', 'budget', 'seed', 'strategy', 'from'],
+  replay: ['spec'],
+  promote: ['spec'],
+  done: ['spec'],
   report: ['list', 'all', 'prune', 'keep', 'junit'],
   guard: ['max-attempts', 'spec'],
   lint: ['spec'],
@@ -17,7 +24,8 @@ export const COMMAND_FLAGS = {
 }
 
 /** Flags that consume the next argument. */
-export const VALUE_FLAGS = new Set(['depth', 'base', 'only', 'spec', 'keep', 'max-attempts', 'base-url'])
+export const VALUE_FLAGS = new Set(['depth', 'base', 'only', 'spec', 'keep', 'max-attempts', 'base-url',
+  'from', 'budget', 'seed', 'strategy'])
 
 /** How many bare arguments each command accepts. */
 export const POSITIONALS = {
@@ -29,6 +37,13 @@ export const POSITIONALS = {
   guard: { max: Infinity, usage: 'proof guard [--max-attempts N] -- <agent command...>' },
   lint: { max: 0, usage: 'proof lint' },
   falsify: { max: 0, usage: 'proof falsify [--base REF]' },
+  seal: { max: 0, usage: 'proof seal' },
+  diff: { max: 0, usage: 'proof diff' },
+  challenge: { max: 0, usage: 'proof challenge [--from "<command>"]' },
+  attack: { max: 1, usage: 'proof attack [<criterion>] [--budget 5m] [--seed N] [--strategy <surface>]' },
+  replay: { max: 1, usage: 'proof replay <counterexample>' },
+  promote: { max: 1, usage: 'proof promote <counterexample>' },
+  done: { max: 0, usage: 'proof done' },
   hook: { max: 0, usage: 'proof hook [--install | --print] [--max-attempts N]' },
 }
 

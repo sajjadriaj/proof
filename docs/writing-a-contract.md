@@ -47,6 +47,47 @@ a given behaviour counts as satisfying it.
 Write the goal before the checks. If you cannot write a goal that a check could fail, the
 requirement is not ready to implement — which is worth finding out now.
 
+## 1b. Break the requirement into criteria, and point checks at them
+
+A requirement is almost never one statement. "Implement secure password reset" is at least
+four: the link is emailed, the token expires, the token is single use, and the flow does not
+reveal whether an account exists. A contract made only of checks cannot say which of those it
+covers — and the ones an agent forgets are exactly the ones nobody wrote a check for.
+
+```yaml
+criteria:
+  - id: AC1
+    requirement: a reset link is emailed
+    source: issue#143
+  - id: AC2
+    requirement: a reset token expires after 30 minutes
+  - id: AC3
+    requirement: a reset token cannot be reused
+  - id: AC4
+    requirement: the reset flow does not reveal whether an account exists
+    source: security-requirements.md
+```
+
+Then every check says which criterion it is evidence for:
+
+```yaml
+- name: a used token is refused
+  satisfies: [AC3]
+  http: {method: POST, path: "/api/password-reset/${used_token}", expect: {status: 401}}
+```
+
+A criterion nothing points at makes every run `INCOMPLETE`, with the id named — so the gap
+shows up as a verdict rather than as something nobody thought of. Write the criteria from the
+requirement, before the checks: it is the same discipline as writing the goal first, one level
+down.
+
+Two rules worth keeping:
+
+- **A criterion is a statement about behaviour, not a task.** "Add a middleware" cannot be
+  verified; "an unauthenticated request to /admin returns 403" can.
+- **Do not invent criteria the requirement did not state.** A contract is about one
+  requirement. Breadth belongs in the suite.
+
 ## 2. One check, one claim
 
 The name of a check is what a failure will be called, in the terminal, in the report, in the

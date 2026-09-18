@@ -11,6 +11,8 @@ import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from '
 import { join } from 'node:path'
 import { loadSpec, PROOF_DIR, SPEC_PATH, writeFileAtomic } from './spec.js'
 import { runCheck, renderFeedback, FEEDBACK } from './guard.js'
+import { coverage, uncovered } from './criteria.js'
+import { integrity } from './seal.js'
 
 const STATE = join(PROOF_DIR, 'hook-state.json')
 const SETTINGS = join('.claude', 'settings.json')
@@ -120,6 +122,20 @@ export async function stopHook({ maxAttempts = DEFAULT_MAX_ATTEMPTS, specPath } 
     const off = (spec.checks ?? []).filter(c => c?.skip !== undefined)
     if (off.length) {
       console.error(`proof: ${off.length} check(s) are skipped in the contract, so no run can report completion — not gating this stop`)
+      return 0
+    }
+    // A criterion nothing verifies is the same shape of wall: no run can report completion,
+    // and blocking every stop over it would spend the agent's budget on something only the
+    // contract's author can fix.
+    const gaps = uncovered(coverage(spec))
+    if (gaps.length) {
+      console.error(`proof: ${gaps.join(', ')} have no check pointing at them, so no run can report completion`
+        + ' — not gating this stop. Add `satisfies:` to the check that proves each one.')
+      return 0
+    }
+    if (integrity(spec, specPath ?? SPEC_PATH).status === 'modified') {
+      console.error('proof: the contract has changed since it was sealed, so no run can report completion'
+        + ' until the change is reviewed — not gating this stop. `proof diff` shows what moved.')
       return 0
     }
   } catch (e) {

@@ -12,7 +12,44 @@
 # machine-readable shape — not just that the suite is green.
 goal: >-
   proof reports a verdict an agent can act on: 0 when the contract passed, 1 when it failed,
-  2 when the contract itself is wrong, and never DONE for something it did not verify
+  2 when the contract itself is wrong, never DONE for something it did not verify, and never
+  DONE on evidence that is not about this contract and this code
+
+# The requirement, as the statements a verdict has to be about. Each one names something this
+# tool promises; `satisfies:` below says which check is the evidence for it. A criterion with
+# nothing pointing at it makes every run INCOMPLETE — which is the promise AC5 is about, held
+# to itself.
+criteria:
+  - id: AC1
+    requirement: a verdict is an exit code an agent can branch on — 0 passed, 1 failed, 2 the contract itself is wrong
+    source: the README's exit-code table
+  - id: AC2
+    requirement: proof never reports DONE for something it did not verify
+    source: the README's "a verdict that means something"
+  - id: AC3
+    requirement: a contract that would pass without the change is reported as not testing it
+    source: docs/design.md, "do not trust the contract either"
+  - id: AC4
+    requirement: every run records the evidence behind its verdict, readable without the contract
+    source: docs/evidence.md
+  - id: AC5
+    requirement: an acceptance criterion with no check pointing at it withholds the completion verdict
+    source: the verification-boundary design note, section 2
+  - id: AC6
+    requirement: a contract edited after it was sealed invalidates the verification chain until it is resealed
+    source: the verification-boundary design note, section 4
+  - id: AC7
+    requirement: a fault the contract accepts is reported as a weakness and kept as a counterexample
+    source: the verification-boundary design note, section 6
+  - id: AC8
+    requirement: the completion verdict is derived from recorded evidence, never from a claim, and evidence from another contract or commit is refused
+    source: the verification-boundary design note, sections 10 and 13
+  - id: AC9
+    requirement: a scenario that satisfies the contract and violates the claim is reported as a verification gap, with the counterexample kept and replayable
+    source: the attack design note, sections 10 and 12
+  - id: AC10
+    requirement: a search that finds nothing reports what it tried and never reports correctness
+    source: the attack design note, sections 19 and 28
 
 checks:
   - name: unit tests
@@ -28,6 +65,7 @@ checks:
 
   # The three exit codes, each against a contract built for it.
   - name: a passing contract exits 0
+    satisfies: [AC1]
     run: >-
       d=$(mktemp -d) && mkdir -p "$d/.proof" &&
       printf 'goal: g\nchecks:\n  - name: a\n    run: "true"\n' > "$d/.proof/spec.yaml" &&
@@ -35,6 +73,7 @@ checks:
     expect_exit: 0
 
   - name: a failing contract exits 1
+    satisfies: [AC1]
     run: >-
       d=$(mktemp -d) && mkdir -p "$d/.proof" &&
       printf 'goal: g\nchecks:\n  - name: a\n    run: exit 3\n' > "$d/.proof/spec.yaml" &&
@@ -42,6 +81,7 @@ checks:
     expect_exit: 1
 
   - name: a broken contract exits 2
+    satisfies: [AC1]
     run: >-
       d=$(mktemp -d) && mkdir -p "$d/.proof" &&
       printf 'goal: g\nchecks:\n  - name: a\n    frobnicate: 1\n' > "$d/.proof/spec.yaml" &&
@@ -50,6 +90,7 @@ checks:
 
   # The refusals that stop a verdict meaning less than it looks.
   - name: an unfinished contract is refused, not passed
+    satisfies: [AC2]
     run: >-
       d=$(mktemp -d) &&
       (cd "$d" && node "$OLDPWD/bin/proof.js" init "a requirement" > /dev/null &&
@@ -58,6 +99,7 @@ checks:
     expect_output: "placeholder"
 
   - name: a subset run never claims completion
+    satisfies: [AC2]
     run: >-
       d=$(mktemp -d) && mkdir -p "$d/.proof" &&
       printf 'goal: g\nchecks:\n  - name: alpha\n    run: "true"\n  - name: beta\n    run: "true"\n' > "$d/.proof/spec.yaml" &&
@@ -66,6 +108,7 @@ checks:
 
   # The shape an agent reads.
   - name: check --json carries a status and the evidence path
+    satisfies: [AC4]
     run: >-
       d=$(mktemp -d) && mkdir -p "$d/.proof" &&
       printf 'goal: g\nchecks:\n  - name: a\n    run: "true"\n' > "$d/.proof/spec.yaml" &&
@@ -76,6 +119,7 @@ checks:
     expect_output: "ok"
 
   - name: every run writes its evidence
+    satisfies: [AC4]
     run: >-
       d=$(mktemp -d) && mkdir -p "$d/.proof" &&
       printf 'goal: g\nchecks:\n  - name: a\n    run: echo hello\n' > "$d/.proof/spec.yaml" &&
@@ -288,6 +332,7 @@ checks:
   # reports DONE. The sanctioned alternative has to cost the completion claim, or it is the
   # same hole with a nicer name.
   - name: a skipped check is refused a completion verdict
+    satisfies: [AC2]
     run: >-
       d=$(mktemp -d) && mkdir -p "$d/.proof" &&
       printf 'goal: g\nchecks:\n  - name: a\n    run: "true"\n  - name: b\n    run: "true"\n    skip: "see #412"\n' > "$d/.proof/spec.yaml" &&
@@ -320,6 +365,7 @@ checks:
   # change had never been made? A check that passes on the code from before the diff reports
   # DONE for a branch that did nothing, and nothing in a green run says so.
   - name: a contract that passes without the change is refused
+    satisfies: [AC3]
     run: >-
       d=$(mktemp -d) && cd "$d" && git init -q -b main . &&
       git config user.email t@t.t && git config user.name t &&
@@ -334,6 +380,7 @@ checks:
   # And the other direction, including the refusal that keeps it honest: a contract that fails
   # on the base only because the base could not run has proved nothing about itself.
   - name: a contract that needs the change discriminates, and a boot failure does not
+    satisfies: [AC3]
     run: >-
       d=$(mktemp -d) && cd "$d" && git init -q -b main . &&
       git config user.email t@t.t && git config user.name t &&
@@ -375,3 +422,140 @@ checks:
       test $rc -eq 0 && test "$ran" = no &&
       printf '%s' "$out" | grep -q 'GET /profile, status 200, body contains "ada"'
     expect_exit: 0
+
+  # The four questions a verdict has to answer, each held to itself. Coverage first: this
+  # contract's own criteria are what AC5 is about, so the check for it builds a contract with a
+  # criterion nobody covered and reads back what the verdict does.
+  - name: an uncovered acceptance criterion is refused a completion verdict
+    satisfies: [AC5]
+    run: >-
+      d=$(mktemp -d) && mkdir -p "$d/.proof" &&
+      printf 'goal: g\ncriteria:\n  - id: AC1\n    requirement: covered\n  - id: AC2\n    requirement: nothing points at this\nchecks:\n  - name: a\n    satisfies: [AC1]\n    run: "true"\n' > "$d/.proof/spec.yaml" &&
+      out=$(cd "$d" && node "$OLDPWD/bin/proof.js" check 2>&1); rc=$?; rm -rf "$d";
+      test $rc -eq 0 && printf '%s' "$out" | grep -q 'INCOMPLETE' && printf '%s' "$out" | grep -q 'AC2'
+    expect_exit: 0
+
+  # Integrity. The contract is the definition of done, so an agent that cannot satisfy it can
+  # edit it. Sealing does not forbid that; it stops the edit from being invisible.
+  - name: a contract edited after sealing costs the completion verdict
+    satisfies: [AC6]
+    run: >-
+      d=$(mktemp -d) && mkdir -p "$d/.proof" &&
+      printf 'goal: g\nchecks:\n  - name: a\n    run: "true"\n' > "$d/.proof/spec.yaml" &&
+      out=$(cd "$d" && node "$OLDPWD/bin/proof.js" seal > /dev/null &&
+       printf 'goal: g\nchecks:\n  - name: a\n    run: "true"\n    timeout: 30\n' > .proof/spec.yaml &&
+       node "$OLDPWD/bin/proof.js" check 2>&1); rm -rf "$d";
+      printf '%s' "$out" | grep -q 'since it was sealed' && printf '%s' "$out" | grep -q 'INCOMPLETE'
+    expect_exit: 0
+
+  # Strength. A contract can need the change and still accept a wrong version of it, and the
+  # useful output is which faults it caught rather than a score.
+  - name: a fault the contract accepts is reported and kept as a counterexample
+    satisfies: [AC7]
+    run: >-
+      d=$(mktemp -d) && cd "$d" && git init -q -b main . &&
+      git config user.email t@t.t && git config user.name t &&
+      mkdir -p .proof && echo 'the feature' > app.txt &&
+      printf 'goal: g\nchecks:\n  - name: the file is there\n    file: app.txt\nchallenges:\n  - name: remove the feature\n    apply: "printf nothing > app.txt"\n' > .proof/spec.yaml &&
+      git add -A && git commit -qm base > /dev/null &&
+      out=$(node "$OLDPWD/bin/proof.js" challenge 2>&1); rc=$?;
+      kept=$(test -f .proof/counterexamples/remove-the-feature.yaml && echo yes || echo no);
+      cd /; rm -rf "$d";
+      test $rc -eq 1 && test "$kept" = yes && printf '%s' "$out" | grep -q 'MISSED'
+    expect_exit: 0
+
+  # The gate itself. Nothing is asserted about the work by the thing doing the work: `done`
+  # runs no checks, it reads the records `falsify` and `check` wrote and derives the verdict.
+  - name: done gates on the recorded chain, not on a claim
+    satisfies: [AC8]
+    run: >-
+      d=$(mktemp -d) && cd "$d" && git init -q -b main . &&
+      git config user.email t@t.t && git config user.name t &&
+      mkdir -p .proof && echo old > app.txt &&
+      printf 'goal: g\ncriteria:\n  - id: AC1\n    requirement: the feature is in the file\nchecks:\n  - name: the feature is there\n    satisfies: [AC1]\n    file: {path: app.txt, contains: "the feature"}\n' > .proof/spec.yaml &&
+      git add -A && git commit -qm before > /dev/null &&
+      echo 'the feature' > app.txt &&
+      node "$OLDPWD/bin/proof.js" done > /dev/null 2>&1; before=$?;
+      node "$OLDPWD/bin/proof.js" falsify > /dev/null 2>&1 &&
+      git commit -qam change > /dev/null &&
+      node "$OLDPWD/bin/proof.js" check > /dev/null 2>&1 &&
+      out=$(node "$OLDPWD/bin/proof.js" done 2>&1); after=$?;
+      manifest=$(test -f .proof/report.json && echo yes || echo no); cd /; rm -rf "$d";
+      test $before -eq 1 && test $after -eq 0 && test "$manifest" = yes &&
+      printf '%s' "$out" | grep -q 'DONE'
+    expect_exit: 0
+
+  # And the other half of AC8: a run is a verdict about one contract. Reusing it across a
+  # contract change would be the quietest way for this whole layer to lie.
+  - name: evidence recorded under another contract is refused, not reused
+    satisfies: [AC8]
+    run: >-
+      d=$(mktemp -d) && cd "$d" && git init -q -b main . &&
+      git config user.email t@t.t && git config user.name t &&
+      mkdir -p .proof && echo 'the feature' > app.txt &&
+      printf 'goal: g\nchecks:\n  - name: the feature is there\n    file: {path: app.txt, contains: "the feature"}\npolicy:\n  require_falsification: false\n' > .proof/spec.yaml &&
+      git add -A && git commit -qm base > /dev/null &&
+      node "$OLDPWD/bin/proof.js" check > /dev/null 2>&1 &&
+      printf 'goal: g\nchecks:\n  - name: the feature is there\n    file: {path: app.txt, contains: "feature"}\npolicy:\n  require_falsification: false\n' > .proof/spec.yaml &&
+      out=$(node "$OLDPWD/bin/proof.js" done 2>&1); rc=$?; cd /; rm -rf "$d";
+      test $rc -eq 1 && printf '%s' "$out" | grep -q 'INVALID'
+    expect_exit: 0
+
+  # The finding this tool exists for, at the layer nothing else can see: the contract passes, the
+  # claim is violated. The app below has the textbook read-then-write window, and the contract
+  # asks twice in a row — which the app answers correctly.
+  - name: a scenario the contract accepts and the claim forbids is a verification gap
+    satisfies: [AC9]
+    timeout: 180
+    run: >-
+      d=$(mktemp -d) && cd "$d" && git init -q -b main . &&
+      git config user.email t@t.t && git config user.name t && mkdir -p .proof &&
+      printf 'import http from "node:http"\nconst used=new Set()\nlet n=0\nhttp.createServer(async(q,s)=>{\n const j=(c,b)=>{s.writeHead(c,{"content-type":"application/json"});s.end(JSON.stringify(b))}\n if(q.url==="/issue")return j(200,{token:"t"+(n++)})\n let b="";for await(const c of q)b+=c\n const t=(JSON.parse(b||"{}")).token\n if(used.has(t))return j(401,{error:"used"})\n await new Promise(r=>setTimeout(r,5))\n used.add(t)\n j(200,{ok:true})\n}).listen(8593)\n' > s.mjs &&
+      printf 'goal: a token can only be redeemed once\nserve:\n  run: node s.mjs\n  ready_url: http://127.0.0.1:8593/issue\n  timeout: 20\ncriteria:\n  - id: AC1\n    requirement: a token cannot be redeemed twice\n    attack:\n      surfaces: [concurrency]\n      setup:\n        - name: issue\n          http: {method: POST, path: /issue}\n          capture: {token: json.token}\n      actions:\n        - name: redeem\n          http: {method: POST, path: /redeem, body: {token: "${token}"}}\n      invariants:\n        - successful_redeem <= 1\nchecks:\n  - name: a token is issued\n    http: {method: POST, path: /issue, expect: {status: 200}}\n    capture: {t: json.token}\n  - name: redeeming it works\n    http: {method: POST, path: /redeem, body: {token: "${t}"}, expect: {status: 200}}\n  - name: redeeming it again is refused\n    satisfies: [AC1]\n    http: {method: POST, path: /redeem, body: {token: "${t}"}, expect: {status: 401}}\n' > .proof/spec.yaml &&
+      git add -A && git commit -qm base > /dev/null &&
+      node "$OLDPWD/bin/proof.js" check > /dev/null 2>&1; passed=$?;
+      out=$(node "$OLDPWD/bin/proof.js" attack 2>&1); found=$?;
+      kept=$(ls .proof/counterexamples 2>/dev/null | wc -l);
+      id=$(ls .proof/counterexamples 2>/dev/null | head -1 | sed 's/.yaml//');
+      node "$OLDPWD/bin/proof.js" replay "$id" > /dev/null 2>&1; again=$?;
+      cd /; rm -rf "$d";
+      test $passed -eq 0 && test $found -eq 1 && test "$kept" -eq 1 && test $again -eq 1 &&
+      printf '%s' "$out" | grep -q 'VERIFICATION_GAP'
+    expect_exit: 0
+
+  # And the other half of the same promise: a search that comes back empty is a budget that ran
+  # out. The one sentence this tool must never print is "no bugs".
+  - name: a search that finds nothing refuses to report correctness
+    satisfies: [AC10]
+    timeout: 180
+    run: >-
+      d=$(mktemp -d) && cd "$d" && git init -q -b main . &&
+      git config user.email t@t.t && git config user.name t && mkdir -p .proof &&
+      printf 'import http from "node:http"\nconst used=new Set()\nlet n=0\nhttp.createServer(async(q,s)=>{\n const j=(c,b)=>{s.writeHead(c,{"content-type":"application/json"});s.end(JSON.stringify(b))}\n if(q.url==="/issue")return j(200,{token:"t"+(n++)})\n let b="";for await(const c of q)b+=c\n const t=(JSON.parse(b||"{}")).token\n if(used.has(t))return j(401,{error:"used"})\n used.add(t)\n await new Promise(r=>setTimeout(r,5))\n j(200,{ok:true})\n}).listen(8594)\n' > s.mjs &&
+      printf 'goal: a token can only be redeemed once\nserve:\n  run: node s.mjs\n  ready_url: http://127.0.0.1:8594/issue\n  timeout: 20\ncriteria:\n  - id: AC1\n    requirement: a token cannot be redeemed twice\n    attack:\n      surfaces: [concurrency]\n      budget: {duration: 30, candidates: 6, concurrency: 3}\n      setup:\n        - name: issue\n          http: {method: POST, path: /issue}\n          capture: {token: json.token}\n      actions:\n        - name: redeem\n          http: {method: POST, path: /redeem, body: {token: "${token}"}}\n      invariants:\n        - successful_redeem <= 1\nchecks:\n  - name: a token is issued\n    http: {method: POST, path: /issue, expect: {status: 200}}\n    capture: {t: json.token}\n  - name: redeeming it again is refused\n    satisfies: [AC1]\n    http: {method: POST, path: /redeem, body: {token: "${t}"}, expect: {status: 200}}\n' > .proof/spec.yaml &&
+      git add -A && git commit -qm base > /dev/null &&
+      out=$(node "$OLDPWD/bin/proof.js" attack 2>&1); rc=$?; cd /; rm -rf "$d";
+      test $rc -eq 0 && printf '%s' "$out" | grep -q 'NO COUNTEREXAMPLE FOUND' &&
+      printf '%s' "$out" | grep -q 'does not establish correctness' &&
+      printf '%s' "$out" | grep -q 'candidates evaluated'
+    expect_exit: 0
+
+# Faults this contract has to catch. Each one is injected into a throwaway copy of the
+# repository and the whole contract is run against it, so `proof challenge` here costs several
+# full runs of the suite — it is a command you run deliberately, not on every commit.
+challenges:
+  - name: stop refusing an unfinished contract
+    breaks: [AC2]
+    apply: "sed -i 's/if (unfinished.length) {/if (false) {/' src/check.js"
+
+  - name: let an uncovered criterion claim completion
+    breaks: [AC5]
+    apply: "sed -i 's/|| uncoveredIds.length > 0//' src/check.js"
+
+  - name: accept any exit code a command happens to return
+    breaks: [AC1]
+    apply: "sed -i 's/const wantExit = c.expect_exit ?? 0/const wantExit = r.code/' src/check.js"
+
+  - name: let a modified contract keep its completion verdict
+    breaks: [AC6]
+    apply: "sed -i \"s/|| seal.status === 'modified'//\" src/check.js"

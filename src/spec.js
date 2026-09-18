@@ -1,5 +1,5 @@
 import { readFileSync, writeFileSync, mkdirSync, existsSync, renameSync, openSync, closeSync, unlinkSync } from 'node:fs'
-import { join, dirname } from 'node:path'
+import { join, dirname, isAbsolute, relative } from 'node:path'
 import YAML from 'yaml'
 import { validateSpec, PLACEHOLDER_RUN, placeholderChecks } from './validate.js'
 import { fileAtRef, forkPoint } from './git.js'
@@ -136,6 +136,24 @@ export function withSpecLock(fn) {
   } finally {
     try { unlinkSync(LOCK_PATH) } catch {}
   }
+}
+
+/**
+ * How a contract is named in the records kept beside it — the seal, the falsification, the
+ * challenge run, the manifest.
+ *
+ * Repository-relative, always. `--spec "$PWD/.proof/spec.yaml"` and `--spec .proof/spec.yaml`
+ * are the same contract, and keying records by the string the caller happened to type would
+ * have quietly given the same file two verification chains: sealed under one name, checked
+ * under the other, and nothing matching anything.
+ *
+ * A path outside the working directory keeps the form it came in with — there is nothing
+ * shorter to call it, and `..`-relative keys would depend on where the command was run.
+ */
+export function contractKey(specPath = SPEC_PATH) {
+  if (!isAbsolute(specPath)) return specPath
+  const here = relative(process.cwd(), specPath)
+  return here && !here.startsWith('..') ? here : specPath
 }
 
 /** Thrown only when the spec file is absent, so callers can tell "no contract" from "broken contract". */

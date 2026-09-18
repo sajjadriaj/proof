@@ -9,6 +9,9 @@
 import { loadSpec, SPEC_PATH } from './spec.js'
 import { placeholderChecks, serveList, serveLabel, VERBS } from './validate.js'
 import { contractAdvisory, assertsContent, describe } from './check.js'
+import { coverage, criteriaList } from './criteria.js'
+import { challengeList } from './challenge.js'
+import { integrity, shortHash } from './seal.js'
 import { block } from './terminal.js'
 
 
@@ -54,10 +57,21 @@ export function lint({ json = false, specPath } = {}) {
   // know which lines to edit.
   const statusOnly = runtime.filter(c => !assertsContent(c)).map(c => c.name ?? '(unnamed)')
 
+  // Coverage from the file alone: which criteria have a check pointing at them. `check` asks
+  // the same question of a run and narrows it to which produced evidence.
+  const criteria = coverage(spec)
+  const uncovered = criteria.filter(c => c.status === 'uncovered').map(c => c.id)
+  const seal = integrity(spec, path)
+
   const out = {
     spec: path,
     goal: spec.goal ?? null,
     says: sentences(spec),
+    criteria,
+    uncovered,
+    challenges: challengeList(spec).map(c => c.name),
+    contract_hash: seal.hash,
+    contract_integrity: seal.status,
     checks: checks.length,
     runtime_checks: runtime.length,
     content_checks: content.length,
@@ -81,7 +95,17 @@ function printHuman(o) {
   if (o.goal) console.log(`\nRequirement:\n${block(o.goal, '  ')}`)
   console.log(`\n${block(`${o.checks} check(s); ${o.runtime_checks} exercise the running app;`
     + ` ${o.content_checks} assert what it returns`
-    + (o.serve ? `; ${o.serve} process(es) started by a serve block` : '; no serve block'), '  ')}`)
+    + (o.serve ? `; ${o.serve} process(es) started by a serve block` : '; no serve block')
+    + (o.criteria.length ? `; ${o.criteria.length - o.uncovered.length} of ${o.criteria.length} criteria covered` : '')
+    + (o.challenges.length ? `; ${o.challenges.length} challenge(s)` : ''), '  ')}`)
+
+  if (o.criteria.length) {
+    console.log('\nWHAT IT COVERS')
+    for (const c of o.criteria) {
+      console.log(`  ${c.id}  ${c.status === 'uncovered' ? 'UNCOVERED' : 'covered'}`)
+      console.log(block(`${c.requirement ?? ''}${c.checks.length ? ` — ${c.checks.join(', ')}` : ''}`, '      '))
+    }
+  }
 
   // The contract read back as what it asserts. A definition of "done" nobody can read is a
   // definition nobody reviews, and the checks are structured precisely so this is derivable.
@@ -100,6 +124,15 @@ function printHuman(o) {
   }
 
   const notes = []
+  if (o.uncovered.length) {
+    notes.push(`${o.uncovered.length} criterion/criteria have no check pointing at them (${o.uncovered.join(', ')})`
+      + ' — a run of this contract cannot report completion, however green it is. Add `satisfies:` to the'
+      + ' check that proves each one, or a check that does.')
+  }
+  if (o.contract_integrity === 'modified') {
+    notes.push(`this contract has changed since it was sealed (now ${shortHash(o.contract_hash)})`
+      + ' — `proof diff` shows what moved, `proof seal` accepts it.')
+  }
   if (o.unfinished.length) {
     notes.push(`${o.unfinished.length} check(s) still hold proof's own placeholder command (${o.unfinished.join(', ')})`
       + ' — `proof check` refuses to run until they are replaced or deleted.')

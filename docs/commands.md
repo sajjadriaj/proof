@@ -10,8 +10,15 @@
 | `proof infer` | Find verification gaps in the current diff; `--write` appends them to the contract |
 | `proof changed` | Blast radius of the diff — reverse import graph plus which checks name each file |
 | `proof lint` | What the contract would prove if every check passed — without booting or running anything |
+| `proof seal` | Fingerprint the contract into `.proof/lock.json`, so a later edit to it is visible rather than silent |
+| `proof diff` | What the contract has changed since it was sealed, and which criteria that leaves without current evidence |
 | `proof falsify` | Run the contract against the code from **before** your change. It has to fail there, or it is not testing the change |
-| `proof check` | Execute the contract; the only command whose exit code means "done" |
+| `proof check` | Execute the contract and record the evidence |
+| `proof challenge` | Inject each declared fault into a throwaway copy of your code; the contract has to fail on every one |
+| `proof attack [<criterion>]` | Search for a scenario where the contract passes and the claim is violated |
+| `proof replay <id>` | Execute a recorded counterexample again. Exit 0 once it no longer reproduces |
+| `proof promote <id>` | Turn a counterexample — a fault or a scenario the contract accepted — into a check |
+| `proof done` | The completion gate: coverage, falsification, challenges, integrity and freshness, in one verdict. Non-zero unless `DONE` |
 | `proof report [run]` | Render the evidence for a run (default: the latest); `--list` shows recent runs, `--all` shows every one |
 | `proof help` | The usage text; `--help` and `-h` are the same |
 | `proof --version` | The installed version, read from `package.json` rather than a copy that can drift |
@@ -20,7 +27,12 @@
 
 Flags: `--json` (machine-readable, on every command), `--force` (init), `--write` (infer),
 `--only TEXT`, `--spec PATH` and `--base-url URL` (check), `--list`, `--all` and `--junit`
-(report), `--depth N` and `--base REF` (changed, infer).
+(report), `--depth N` and `--base REF` (changed, infer), `--from CMD` (challenge, attack),
+`--budget T`, `--seed N` and `--strategy S` (attack).
+
+`proof check` answers "did the contract pass". `proof done` answers "does the evidence justify
+calling this finished", which is a different question with more inputs — and it is the one an
+agent loop and a CI gate should branch on.
 
 `--spec PATH` runs a contract kept somewhere other than `.proof/spec.yaml` — a release
 contract, a contract per environment. It works on every command that touches a contract —
@@ -164,6 +176,376 @@ Two things are worth knowing about how the base is prepared:
 This is the acceptance-level version of watching a test go red before you make it green — and
 unlike that, it is mechanical rather than a thing you have to remember to do.
 
+### Requirement coverage
+
+A contract can be valid, green, and silent about half of what was asked for. `criteria:` names
+the statements the change has to satisfy; `satisfies:` on a check says that check is the
+evidence for one:
+
+```yaml
+goal: secure password reset
+criteria:
+  - id: AC1
+    requirement: a reset token expires after 30 minutes
+    source: {type: github_issue, reference: "#143"}
+  - id: AC2
+    requirement: a reset token cannot be reused
+checks:
+  - name: an expired token is refused
+    satisfies: [AC1]
+    run: npm run test:reset-expiry
+  - name: a used token is refused
+    satisfies: [AC2]
+    run: npm run test:reset-reuse
+```
+
+Every run then reports what the requirement, rather than the check list, looks like:
+
+```
+REQUIREMENT COVERAGE
+  AC1  a reset token expires after 30 minutes  VERIFIED
+  AC2  a reset token cannot be reused          UNCOVERED
+```
+
+| Status | Means |
+| --- | --- |
+| `verified` | Every check that carries it passed in this run |
+| `failed` | A check that carries it failed |
+| `unverified` | A check carries it, and this run produced no result for it — skipped, or not selected by `--only` |
+| `uncovered` | No check declares `satisfies` for it. Nothing in the run is evidence for it |
+
+An uncovered criterion makes the run `INCOMPLETE`, however green it is — the same rule a
+`skip:` follows, for the same reason. `proof lint` reports coverage from the file alone, before
+a run is spent on it, and `proof guard` and the Stop hook refuse to start against a contract
+with one: no amount of code can close a gap in the contract.
+
+`source` is free text or `{type, reference}`. Nothing integrates with it; it is there so a
+reader of a verdict months later can get from a criterion back to whoever asked for it.
+
+### Sealing the contract, and seeing it move
+
+The contract is the definition of "done", so an agent that cannot make a check pass can edit
+the check instead. `proof seal` records what the contract was:
+
+```console
+$ proof seal
+
+Contract sealed.
+SHA256:
+  7fd84b9c2a1163f0a04e2a0a0f0fb2d0d4f3c1d2a1b0e9f8d7c6b5a4938271605
+
+3 criterion/criteria: AC1, AC2, AC3
+
+Recorded in .proof/lock.json. Commit it: the seal is what says this contract was reviewed.
+```
+
+The fingerprint is over the contract's *content* — the parsed YAML, with key order normalised —
+so reindenting a block or rewrapping a comment does not break it, and moving an assertion does.
+
+After that, `proof check` compares the two on every run. A contract that has moved reports
+`INCOMPLETE` with the reason, and `proof diff` says what moved:
+
+```console
+$ proof diff
+
+CONTRACT CHANGES since 7fd84b9c2a11 (sealed 2025-03-02T11:04:19Z)
+
+  + AC9
+  ~ AC3
+  - check "the legacy endpoint answers"
+
+VERIFICATION AFFECTED
+  AC9   UNVERIFIED
+  AC3   REVERIFY
+```
+
+`UNVERIFIED` is a criterion no run has ever been about; `REVERIFY` is one whose own text or
+whose checks have changed since the evidence was recorded. Sealing again accepts the new
+contract and starts a new verification generation — evidence recorded under the old one is not
+carried over, because it is evidence about a different definition of "done".
+
+Nothing here forbids changing a contract. A tool that made that expensive would be worked
+around; this one only makes it visible.
+
+### Challenging the contract
+
+`falsify` asks whether the contract can tell the old code from the new. `challenge` asks the
+other question: **would this contract catch a wrong implementation?**
+
+```yaml
+challenges:
+  - name: allow token reuse
+    breaks: [AC2]
+    apply: "sed -i 's/markTokenUsed(token)//' src/reset.js"
+  - name: skip the database write
+    breaks: [AC1]
+    apply: "sed -i 's/await db.save(reset)//' src/reset.js"
+```
+
+Each `apply` command runs against a throwaway git worktree holding your code as it stands —
+tracked changes and the files git has not seen yet, your own files never touched — and the
+contract is run there. It has to fail:
+
+```console
+$ proof challenge
+
+CONTRACT CHALLENGE
+
+  2 fault(s) injected into a copy of your code as it stands (tracked changes at 47e2b80bea85),
+  one at a time. The contract has to fail on each.
+
+FAULT                                        DETECTION
+  allow token reuse       DETECTED  a used token is refused
+  skip the database write MISSED
+
+WEAKNESS
+  skip the database write — the contract passed with this fault applied, so it cannot report
+  this class of wrong implementation.
+
+  .proof/counterexamples/skip-the-database-write.yaml
+
+VERDICT
+  WEAKNESS FOUND
+  1 detected, 1 missed, 0 inconclusive
+```
+
+| Outcome | Means |
+| --- | --- |
+| `DETECTED` | At least one check failed for a reason that is the fault |
+| `MISSED` | Every check passed with the fault applied. A counterexample is written |
+| `INCONCLUSIVE` | The fault command failed, it changed nothing in the copy, or the only failures were a crashed runner or a missing binary |
+
+`INCONCLUSIVE` is what keeps the command honest, exactly as in `falsify`: a fault that never
+applied says nothing about the contract, and counting it as detection would be false
+reassurance in the place it costs most. Before any fault runs, the contract is run once
+unmodified — a contract that already fails would make every fault look detected.
+
+There is no quality score, deliberately. What is useful is *which* wrong implementations this
+contract can report and which it cannot.
+
+`--from "<command>"` adds challenges from any program that prints `{name, apply, breaks}`
+objects as JSON on stdout — an adversarial agent, a criterion-aware semantic prober, a
+language-specific mutation tool. They are held to exactly the rules a written challenge is
+held to, and proof is what runs and judges them: the generator is never the root of trust.
+
+### Counterexamples, and promoting one
+
+Every missed fault is written to `.proof/counterexamples/<id>.yaml` — the fault, the criterion
+it violates, the commit and the contract it was found against. `proof promote <id>` turns one
+into a check:
+
+```yaml
+# This fault went unnoticed by every check: sed -i 's/await db.save(reset)//' src/reset.js
+# Recorded 2025-03-02T12:41:08Z against 47e2b80bea85.
+# Replace the command with the assertion that would have caught it.
+- name: "counterexample: skip the database write"
+  run: 'echo "TODO: assert the behaviour this fault broke"'
+  satisfies:
+    - AC1
+```
+
+It is written with proof's own placeholder command on purpose: proof knows which fault went
+unnoticed and cannot know what assertion would have noticed it. `proof check` refuses a
+contract holding a placeholder, so the promoted check cannot sit there passing and looking like
+coverage. Write the assertion, and the contract is permanently stronger than the one that
+missed it.
+
+### Attacking a claim
+
+`falsify` asks whether the contract can tell the old code from the new. `challenge` asks whether
+it catches faults you named. `attack` asks the question underneath both:
+
+> Can a scenario be found where the contract passes and the claim does not hold?
+
+That finding has a name — a **verification gap** — and it is the only one in this tool that is
+about the verifier rather than the code.
+
+It needs two judges that can disagree:
+
+| Oracle | Is |
+| --- | --- |
+| Contract oracle | The checks that carry the criterion, run against the app in the state the attack left it |
+| Requirement oracle | An invariant: one comparison, counted over what the attack actually observed |
+
+If only the first says yes, the contract has a hole in it.
+
+```yaml
+criteria:
+  - id: AC3
+    requirement: a reset token cannot be redeemed twice
+    attack:
+      surfaces: [concurrency, sequence, input]
+      budget: {duration: 60, candidates: 50, concurrency: 4}
+      permissions: {network: same-origin}
+      setup:
+        - name: issue
+          http: {method: POST, path: /issue}
+          capture: {token: json.token}
+      actions:
+        - name: redeem
+          http: {method: POST, path: /redeem, body: {token: "${token}"}}
+      invariants:
+        - successful_redeem <= 1
+```
+
+| Key | Means |
+| --- | --- |
+| `setup` | Steps that run before every scenario — what makes each candidate independent of the last. They must succeed, or the attempt is an `ATTACK_ERROR` rather than a finding |
+| `actions` | The operations an attack may compose. Named, because an invariant counts them by name. Exactly one `http` or `run` each, and **no `expect`** — an attack has no expectations, only observations |
+| `invariants` | What must remain true. One comparison each: `<term> <op> <whole number>` |
+| `surfaces` | Which strategies may run: `input`, `sequence`, `concurrency` |
+| `budget` | `duration` in seconds, `candidates` evaluated, and the widest `concurrency` a parallel step builds |
+| `permissions` | `network: same-origin` (the default) or `any`. An action pointed at another host is refused under the default |
+
+Invariant terms are counted from the steps that ran: `successes`, `failures`, `steps`,
+`successful_<action>`, `failed_<action>`, `status_<code>`, `status_2xx`, `status_4xx`,
+`status_5xx`. "Successful" is a status below 400 for a request and exit 0 for a command — the
+operation having actually happened, which is what an at-most-once claim counts.
+
+It is deliberately one comparison and not an expression language. The moment an invariant needs
+`&&` or a helper it is a test, and `run: npx playwright test` is how you reach one from here.
+
+**The strategies:**
+
+| Surface | Builds |
+| --- | --- |
+| `concurrency` | The same action *N* times at once — what a sequence of requests structurally cannot show |
+| `sequence` | The same action twice, one action after another, and an action after the pair that should have ended it |
+| `input` | One body field at a time replaced with an empty string, `null`, `0`, `-1`, a huge number, a 4096-character string, unicode, or the wrong type |
+
+Concurrency is tried first: the cheapest strong attack should not wait behind four hundred
+boundary values. Everything after it is shuffled with the run's seed, which is printed so the
+same search can be run again.
+
+```console
+$ proof attack AC3 --budget 2m --seed 1974540407
+```
+
+**The five outcomes**, because two would be a lie:
+
+| Result | Means |
+| --- | --- |
+| `NO_COUNTEREXAMPLE_FOUND` | The budget ran out. This is not correctness, and the report says so |
+| `COUNTEREXAMPLE_CANDIDATE` | Something suspicious — a 5xx — with no invariant broken. A defect, not a proven claim violation |
+| `CLAIM_VIOLATION` | The invariant was broken, and the contract noticed too |
+| `VERIFICATION_GAP` | The invariant was broken and the contract passed. The strongest finding here |
+| `ATTACK_ERROR` | The scenario could not be executed — usually setup that did not succeed |
+
+Exit `1` on a gap or a violation, `0` otherwise, `2` for a contract that cannot be attacked at
+all. `proof done` blocks on a gap or a violation whatever its policy says, and
+`policy: {require_attack: true}` makes having searched a condition of `DONE`.
+
+**Boundaries.** An attack executes only the actions the criterion declares, against the app the
+contract starts. A declared action pointing at another host is refused unless
+`permissions: {network: any}`. Nothing mutates the environment; nothing writes outside the
+project. A generator cannot widen any of that — see below.
+
+**Generated candidates.** `--from "<command>"` reads `{hypothesis, strategy, steps}` objects as
+JSON on stdout, with `PROOF_ATTACK_CRITERION` and `PROOF_ATTACK_ACTIONS` in the environment. The
+steps may only compose actions the criterion declares — a generator that names an operation the
+contract never did is refused, by name. This is where an adversarial agent, a property-based
+generator or a model-based explorer plugs in: it proposes, proof executes and judges. A
+hypothesis is not evidence.
+
+### Replaying a counterexample
+
+```console
+$ proof replay ce-17f09e06
+
+REPLAY ce-17f09e06
+
+Claim:
+  a reset token cannot be redeemed twice
+
+STEPS
+  redeem                          200
+  redeem                          200
+
+Invariant:
+  successful_redeem <= 1
+Observed:
+  successful_redeem = 2
+
+VERDICT
+  COUNTEREXAMPLE REPRODUCED
+```
+
+Exit `1` while it still reproduces, `0` once it does not — green means the claim holds, the same
+way it does everywhere else here. That is what makes a promoted counterexample an ordinary
+check: `proof promote ce-17f09e06` writes `run: proof replay ce-17f09e06` into the contract, and
+it goes green the moment the bug is fixed and red again if it ever comes back.
+
+If something is already answering at the contract's URL, replay uses it rather than starting a
+second app — which is exactly what happens when a promoted counterexample runs inside
+`proof check`. The outcome is written back beside the counterexample as `last_replay`; a
+scenario that stops reproducing is never deleted, because "fixed" and "intermittent" look
+identical from here and only one of them is good news.
+
+### The completion gate
+
+```console
+$ proof done
+
+PROOF DONE
+
+Requirement:
+  secure password reset
+
+  Implementation          abc123def456
+  Contract                SEALED
+  Criteria                4/4 VERIFIED
+  Checks                  9/9 PASS (run 0012)
+  Falsification           PASS
+  Challenges              COMPLETE
+  Flakes                  NONE
+  Evidence                CURRENT
+
+VERDICT
+  DONE
+```
+
+`done` runs nothing. Every input is a record some earlier command wrote — the latest run of
+this contract, the seal, the falsification record, the challenge record — and the verdict is
+derived from them:
+
+| Verdict | Exit | Means |
+| --- | --- | --- |
+| `DONE` | 0 | Every condition the policy requires is satisfied by evidence on disk |
+| `INCOMPLETE` | 1 | The evidence is not there yet. Each missing piece is named |
+| `INVALID` | 1 | The chain cannot be trusted: evidence recorded for another commit or another contract, a baseline that no longer exists, a sealed contract that moved under a policy requiring one |
+
+How much is required is the project's to choose, in the contract:
+
+```yaml
+policy:
+  require_criteria_coverage: true         # default: a declared criterion needs evidence
+  require_criteria_falsification: false   # every criterion must fail on the base commit
+  require_falsification: true             # default: the contract must fail without the change
+  require_sealed_contract: false          # the contract must match its seal
+  require_challenges: false               # the declared faults must have been run and caught
+  allow_flakes: false                     # default
+  allow_skipped: false                    # default
+```
+
+A prototype can drop to `require_falsification` alone; a security-sensitive repository can
+require all of it. Every run writes `.proof/report.json`, the verification manifest:
+
+```json
+{
+  "verdict": "DONE",
+  "implementation": {"git_commit": "abc123def456", "run": "0012"},
+  "contract": {"hash": "7fd84b…", "sealed": true, "modified": false},
+  "coverage": {"AC1": "verified", "AC2": "verified"},
+  "falsification": {"baseline": "def456…", "result": "discriminates"},
+  "challenges": {"detected": ["allow token reuse"], "missed": [], "inconclusive": []},
+  "reasons": []
+}
+```
+
+That file is the artifact for CI, a pull-request check, an audit trail or a deployment gate —
+one place that says why this implementation was accepted. With `--spec`, a contract other than
+`.proof/spec.yaml` writes its manifest beside it as `report-<contract>.json`.
+
 ### Verifying something already running
 
 `proof check --base-url https://staging.example.com` points the run at an app proof did not
@@ -283,6 +665,15 @@ sentence proof is free to reword:
 | `ENOREPO` | `changed` ran outside a git repository | Run inside a repository, or `git init` |
 | `EWRITE` | Evidence or contract could not be written | Permissions, disk, a read-only mount, or a directory removed mid-run |
 | `EBADRUN` | A run's `result.json` could not be read | `proof report --list` shows the readable ones |
+| `EUNCOVERED` | `guard` or the Stop hook was pointed at a contract with a criterion nothing verifies | No run could report completion, so no loop can end. Add `satisfies:` to the check that proves it |
+| `ENOSEAL` | `diff` was asked what changed, and the contract was never sealed | `proof seal` |
+| `ENOCHALLENGES` | `challenge` has no faults to inject | Add a `challenges:` list, or pass `--from "<command>"` |
+| `ECONTROL` | `challenge` found the contract already failing on your code | Get `proof check` green first: every fault would look detected by a failure that was there beforehand |
+| `ENOCOUNTEREXAMPLE` | `promote` or `replay` was given an id that is not on disk, or one of the wrong kind | The message lists what there is |
+| `ENOATTACK` | `attack` found no criterion declaring an attack surface | Add an `attack:` block; the message suggests surfaces from how each claim is worded |
+| `ENOCRITERION` | `attack <id>` named a criterion that is not declared, or one with no attack surface | The message lists the declared ids |
+| `ENOSERVE` | `attack` was run against a contract that starts nothing | An attack composes requests against a running app, so it needs a `serve` block |
+| `ENOBASE` | `falsify` or `challenge` found no commit to work from | Commit the code as it was |
 
 `problems` is present whenever proof has a list — a contract that does not validate, mainly.
 An agent fixing a contract wants them one at a time; re-parsing `  - ` out of a multi-line
@@ -303,6 +694,9 @@ string is a parser nobody should have to write against a tool built for agents.
 | `only` | The `--only` text, or `null` |
 | `serve_skipped` | True when a subset selected nothing that needs the app, so the `serve` block was not started |
 | `skipped` | `{check, reason}` for each check switched off with `skip:` in the contract. One of these makes the run `partial` |
+| `criteria` | `{id, requirement, source, checks, status}` per declared acceptance criterion: which checks are evidence for it and what this run says about them. `status` is `verified`, `failed`, `unverified` or `uncovered`. An `uncovered` one makes the run `partial` |
+| `contract_hash` | Fingerprint of the contract this verdict is about. Evidence never carries across a change to it |
+| `contract_integrity` | `valid`, `modified` or `unsealed` — whether the contract still matches `proof seal`. `modified` makes the run `partial` |
 | `flaky` | `{check, failed, of}` for each check whose recent history holds both outcomes for the same assertion |
 | `against` | The URL `--base-url` pointed the run at, or `null` when proof started the app itself |
 | `advisory` | Set when a passing run proves less than it appears to, otherwise `null` |
@@ -311,8 +705,32 @@ string is a parser nobody should have to write against a tool built for agents.
 | `selected_checks` | How many `--only` selected |
 | `ran_checks` | How many contract checks actually ran (synthetic `serve` checks excluded) |
 | `checks` | `{name: status}` for everything that ran, including `app boots` and friends |
-| `results` | `{name, kind, asserted, status, observed, ms}` per check, plus `expected` and `output` on a failure, `evidence`, `warnings`, `cookies_set`, `captured`, `output_clipped`, `body_clipped` where they apply. A `run` check carries `exit_code`; a retried check carries `attempts`; a check whose runner threw carries `crashed`, which is how a caller tells a failure about the code from one that never reached it. `status` is `passed`, `failed` or `skipped` |
+| `results` | `{name, kind, asserted, status, observed, ms}` per check, plus `criteria` — the ids this check is evidence for — plus `expected` and `output` on a failure, `evidence`, `warnings`, `cookies_set`, `captured`, `output_clipped`, `body_clipped` where they apply. A `run` check carries `exit_code`; a retried check carries `attempts`; a check whose runner threw carries `crashed`, which is how a caller tells a failure about the code from one that never reached it. `status` is `passed`, `failed` or `skipped` |
 | `failures` | `{check, expected, observed, output, evidence, was, since}` for each failure. `was` is that check's status in the most recent finished run before this one — `passed`, `failed`, `changed` if a check of that name ran but asserted something else, or `null` if it did not run there. `since` is that run's id |
+
+`proof seal --json` carries `status`, `spec`, `contract_hash`, `previous_hash`, `sealed_at`,
+`commit`, `criteria` and `lock`. `proof diff --json` carries `sealed_hash`, `contract_hash`,
+`goal_changed`, `policy_changed`, `other_changed`, `criteria`, `checks` and `challenges` (each
+`{added, changed, removed}`), `affected` and `unchanged`.
+
+`proof falsify --json` additionally carries `criteria` (`{id, status, checks}`, where `status`
+is `falsified`, `already-satisfied`, `inconclusive` or `uncovered`), `criteria_not_falsified`
+and `contract_hash`; the same object is kept in `.proof/falsification.json`.
+
+`proof challenge --json` carries `status`, `contract_hash`, `commit`, `state`, `results`
+(`{name, source, breaks, apply, status, reason, detected_by, criteria_detected}`), `detected`,
+`missed`, `inconclusive` and `counterexamples`; the same object is kept in
+`.proof/challenges.json`.
+
+`proof attack --json` carries `status`, `seed`, `contract_hash`, `commit`, `tree`, `criteria`
+(`{criterion, result, strategy, hypothesis, invariant, observed, contract, counterexample,
+candidates_evaluated, budget, strategies}`), `gaps`, `violations` and `counterexamples`; the same
+object is kept in `.proof/attacks.json`. `proof replay --json` carries `counterexample`,
+`criterion`, `reproduced`, `invariant`, `observed`, `attached`, `steps` and `error`.
+
+`proof done --json` is the manifest written to `.proof/report.json`: `verdict`, `spec`, `goal`,
+`implementation`, `contract`, `criteria`, `coverage`, `checks`, `falsification`, `challenges`,
+`policy` and `reasons`.
 
 `proof report --json` returns the same object plus `stale`, and keeps each result's full
 `output`; `proof check --json` omits it there to stay small, since the complete text is in

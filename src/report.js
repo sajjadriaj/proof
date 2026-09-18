@@ -2,7 +2,7 @@ import { readFileSync, writeFileSync, readdirSync, existsSync, statSync, rmSync 
 import { join, basename, relative } from 'node:path'
 import { PROOF_DIR, writeError } from './spec.js'
 import { RUNS, dirSize, humanBytes, missingRunFields } from './runs.js'
-import { VERDICT, STATUS_TAG } from './check.js'
+import { VERDICT, STATUS_TAG, verdictLine } from './check.js'
 import { fingerprint } from './git.js'
 import { TERMINAL_WIDTH, truncateToWidth } from './terminal.js'
 
@@ -133,7 +133,7 @@ export function markdown(r) {
 
   p(`# Proof report`)
   p(``)
-  p(`**Verdict:** ${VERDICT[r.status] ?? r.status}${r.stale ? ' — STALE' : ''}`)
+  p(`**Verdict:** ${verdictLine(r)}${r.stale ? ' — STALE' : ''}`)
   if (r.partial) {
     p(`**Subset run:** ${inlineCode(`--only "${r.only}"`)} — ${r.selected_checks} of ${r.contract_checks} check(s)`)
   }
@@ -144,6 +144,12 @@ export function markdown(r) {
   p(`**Run:** \`${r.run}\``)
   p(`**Verified at:** ${r.at}`)
   if (r.git?.head) p(`**Commit:** \`${r.git.head.slice(0, 12)}\`${r.git.branch ? ` (${r.git.branch})` : ''}`)
+  // Which contract, by content. Two runs of "the same" contract a week apart are only
+  // comparable if this line matches, and the file itself is long gone by review time.
+  if (r.contract_hash) {
+    const seal = { valid: 'sealed', modified: 'MODIFIED since it was sealed', unsealed: 'not sealed' }[r.contract_integrity]
+    p(`**Contract hash:** \`${String(r.contract_hash).slice(0, 12)}\`${seal ? ` — ${seal}` : ''}`)
+  }
 
   // The report is the artifact people read and share. A caveat that appears only in the
   // terminal output of `proof check` is missing from the document that makes the claim.
@@ -189,6 +195,26 @@ export function markdown(r) {
     if (noisy.length) {
       p(``)
       p(`Set \`expect_no_console_errors: true\` on a browser check to fail on these.`)
+    }
+  }
+
+  // The requirement, and what this run is evidence for. A reviewer reading a green report
+  // wants this before the check table: the checks passed, and this is what that covers.
+  if (r.criteria?.length) {
+    p(``)
+    p(`## Requirement coverage`)
+    p(``)
+    p(`| Criterion | Requirement | Evidence | Result |`)
+    p(`| --- | --- | --- | --- |`)
+    for (const c of r.criteria) {
+      const evidence = c.checks?.length ? c.checks.map(inlineCode).join(', ') : '—'
+      p(`| ${cell(c.id)} | ${cell(c.requirement ?? '')} | ${evidence} | ${c.status.toUpperCase()} |`)
+    }
+    const uncovered = r.criteria.filter(c => c.status === 'uncovered')
+    if (uncovered.length) {
+      p(``)
+      p(`> **Uncovered:** ${uncovered.map(c => cell(c.id)).join(', ')} — no check in this contract is`)
+      p(`> evidence for ${uncovered.length > 1 ? 'them' : 'it'}, so this run cannot report completion.`)
     }
   }
 

@@ -46,10 +46,15 @@ jobs:
 
       # The contract has to fail on the code this branch started from, or it is not about this
       # branch. Only on a pull request: on main there is no "before" to compare against.
+      #
+      # `done` then gates on the whole chain rather than on the run: every criterion covered by
+      # evidence, the falsification on record, the evidence about this commit and this contract.
+      # It needs the falsification above, which is why it is in the same pull-request-only step.
       - if: github.event_name == 'pull_request'
         run: |
           git fetch --no-tags --depth=0 origin "${{ github.base_ref }}"
           node bin/proof.js falsify --base "origin/${{ github.base_ref }}"
+          node bin/proof.js done
 
   windows:
     # Visibility, not a gate. The runtime has a win32 branch for process teardown, but the

@@ -12,6 +12,8 @@ the ones that catch an agent's false "done".
 - [Database migrations](#database-migrations)
 - [A security fix — verifying removals](#a-security-fix--verifying-removals)
 - [A browser flow with a session](#a-browser-flow-with-a-session)
+- [A multi-part requirement, verified end to end](#a-multi-part-requirement-verified-end-to-end)
+- [A claim worth attacking](#a-claim-worth-attacking)
 - [Guarding an agent through any of these](#guarding-an-agent-through-any-of-these)
 
 ## A CLI tool (no server at all)
@@ -416,6 +418,180 @@ Why these checks:
   browser flow proves the session is real, not a rendering artifact.
 - On failure the evidence bundle carries a screenshot, the request log and the console
   errors — the difference between "browser test failed" and something an agent can fix.
+
+## A multi-part requirement, verified end to end
+
+Requirement: *"secure password reset"* — the shape where a contract most often passes while
+half the requirement is unverified. Four things were asked for, and an agent left to write
+checks after the fact will produce three about the happy path:
+
+```yaml
+goal: a user can reset a forgotten password, and the reset flow is safe
+serve:
+  run: npm run dev
+  ready_url: http://localhost:3000
+
+criteria:
+  - id: AC1
+    requirement: requesting a reset emails a link
+    source: {type: github_issue, reference: "#143"}
+  - id: AC2
+    requirement: a reset token expires after 30 minutes
+    source: {type: github_issue, reference: "#143"}
+  - id: AC3
+    requirement: a reset token cannot be used twice
+  - id: AC4
+    requirement: the flow does not reveal whether an account exists
+    source: security-requirements.md
+
+checks:
+  - name: the suite still passes
+    run: npm test
+
+  - name: requesting a reset accepts the address and queues the mail
+    satisfies: [AC1]
+    http:
+      method: POST
+      path: /api/password-reset
+      body: {email: ada@example.com}
+      expect: {status: 200, json: {sent: true}}
+    capture: {token: json.debug_token}
+
+  - name: a token older than its lifetime is refused
+    satisfies: [AC2]
+    http:
+      method: POST
+      path: /api/password-reset/confirm
+      body: {token: "expired-fixture-token", password: "hunter3"}
+      expect: {status: 401, json: {error: "token_expired"}}
+
+  - name: the same token cannot be spent twice
+    satisfies: [AC3]
+    http:
+      method: POST
+      path: /api/password-reset/confirm
+      body: {token: "${token}", password: "hunter3"}
+      expect: {status: 200}
+
+  - name: an unknown address answers exactly like a known one
+    satisfies: [AC4]
+    http:
+      method: POST
+      path: /api/password-reset
+      body: {email: nobody@example.com}
+      expect: {status: 200, json: {sent: true}}
+
+challenges:
+  - name: allow the token to be spent twice
+    breaks: [AC3]
+    apply: "sed -i 's/await markTokenUsed(token)//' src/reset.js"
+  - name: answer 404 for an unknown address
+    breaks: [AC4]
+    apply: "sed -i 's/return ok(res)/return notFound(res)/' src/reset.js"
+
+policy:
+  require_criteria_coverage: true
+  require_falsification: true
+  require_challenges: true
+```
+
+The lifecycle that goes with it:
+
+```bash
+proof lint        # 4 of 4 criteria covered — the gap would show up here, before any run
+proof seal        # this is the contract that was agreed
+proof falsify     # it has to fail on the commit the branch started from
+#  … implement …
+proof check       # execute it
+proof challenge   # would it notice a version of this that is wrong?
+proof done        # the only question that matters, and the one CI runs
+```
+
+Why it is shaped this way:
+
+- **The criteria come from the ticket, not from the diff.** `AC4` is the one an implementation
+  agent forgets, and an uncovered `AC4` makes every run `INCOMPLETE` — the gap arrives as a
+  verdict rather than as something nobody thought of.
+- **The enumeration check asserts sameness, not a status.** "An unknown address answers exactly
+  like a known one" is a claim about two responses; the check pins the one that is easy to get
+  wrong.
+- **The challenges are the ways the change could be wrong**, not syntactic mutations. Each one
+  is a sentence someone could have written in review, and `proof challenge` answers it with a
+  run rather than an opinion.
+
+## A claim worth attacking
+
+Requirement: *"a password-reset token can only be redeemed once."* The contract below passes on
+an implementation with a textbook race in it, which is exactly the situation `proof attack`
+exists for.
+
+```yaml
+goal: a password-reset token can only be redeemed once
+serve:
+  run: npm run dev
+  ready_url: http://localhost:3000
+
+criteria:
+  - id: AC1
+    requirement: a reset token cannot be redeemed twice
+    source: issue#143
+    attack:
+      surfaces: [concurrency, sequence]
+      setup:
+        - name: issue
+          http: {method: POST, path: /issue}
+          capture: {token: json.token}
+      actions:
+        - name: redeem
+          http: {method: POST, path: /redeem, body: {token: "${token}"}}
+      invariants:
+        - successful_redeem <= 1
+
+checks:
+  - name: a token is issued
+    http: {method: POST, path: /issue, expect: {status: 200}}
+    capture: {t: json.token}
+  - name: redeeming a fresh token works
+    http: {method: POST, path: /redeem, body: {token: "${t}"}, expect: {status: 200, json: {ok: true}}}
+  - name: redeeming the same token again is refused
+    satisfies: [AC1]
+    http: {method: POST, path: /redeem, body: {token: "${t}"}, expect: {status: 401}}
+```
+
+`proof check` reports `DONE`: the second redemption really does return `401`. `proof attack`
+sends two at once:
+
+```
+VERIFICATION GAP  AC1
+  2 concurrent redeem requests may all succeed
+  Invariant:
+    successful_redeem <= 1
+  Observed:
+    successful_redeem was 2
+  Contract:
+    redeeming the same token again is refused: PASSED
+```
+
+Then the loop that leaves the contract stronger than it was:
+
+```bash
+proof replay ce-17f09e06     # reproduces: exit 1
+# … fix the read-then-write window: claim the token before the await …
+proof replay ce-17f09e06     # no longer reproduces: exit 0
+proof promote ce-17f09e06    # now it is a check in the contract, forever
+```
+
+Why it is shaped this way:
+
+- **The invariant is not the check.** `redeeming the same token again is refused` is a claim
+  about one sequence; `successful_redeem <= 1` is a claim about the requirement. The attack is
+  only able to find anything because those two can disagree.
+- **`setup` runs before every scenario**, so each candidate gets its own token and one attempt
+  cannot poison the next.
+- **The finding is minimized before it is kept.** Five concurrent requests and two make the same
+  point; the counterexample records two.
+- **The promoted check is `proof replay ce-…`**, which needs `proof` on PATH the way CI runs it,
+  and goes red again the day someone reintroduces the window.
 
 ## Guarding an agent through any of these
 

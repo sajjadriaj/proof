@@ -110,7 +110,11 @@ export function changedFiles(base = 'HEAD') {
 export function fingerprint() {
   const sha = head()
   if (!sha) return null
-  const diff = git('diff', 'HEAD') ?? ''
+  // Everything but `.proof`. Its own records — the seal, the falsification, the challenge run,
+  // the manifest — are written by proof between runs, and counting them would make every
+  // command that records something invalidate the verdict recorded a moment earlier. What the
+  // contract itself says is tracked by its hash, which is a better answer than a tree diff.
+  const diff = git('diff', 'HEAD', '--', ':/', ':(exclude,top).proof') ?? ''
   return `${sha}:${createHash('sha1').update(diff).digest('hex')}`
 }
 

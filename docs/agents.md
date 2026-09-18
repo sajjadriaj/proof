@@ -5,9 +5,37 @@
 ## The agent loop
 
 ```
-Implement → proof check --json → PASS → done
-                    │
+Implement → proof check --json → PASS → proof done → DONE
+                    │                        │
+                    │                        └─ INCOMPLETE → what is missing → back to work
                     └─ FAIL → read evidence → fix → proof check --json
+```
+
+`proof check` answers *did the contract pass*. `proof done` answers *does the evidence justify
+calling this finished* — which is the question an agent is not allowed to answer for itself:
+
+```bash
+until proof done; do agent "make .proof/spec.yaml pass"; done
+```
+
+It exits non-zero unless the verdict is `DONE`, and every reason it is not is a sentence naming
+what to do: a criterion nothing verifies, a contract that was never shown to fail without the
+change, a fault the contract accepted, a scenario that satisfies the contract and violates the
+claim, evidence recorded against another commit. The full chain
+and its policy knobs are in [the command reference](commands.md#the-completion-gate).
+
+The order the lifecycle runs in:
+
+```bash
+proof init "<requirement>"   # the contract, from the requirement
+proof lint                   # read it back; is every criterion covered?
+proof seal                   # this is the contract that was agreed
+proof falsify                # it fails without the change, or it is not testing it
+#   … the agent implements …
+proof check                  # execute it
+proof challenge              # would it catch a wrong implementation?
+proof attack                 # is there a way to be wrong that it would accept?
+proof done                   # the only question that matters
 ```
 
 Any agent that can run a shell command can use `proof`. There is no SDK and no integration.

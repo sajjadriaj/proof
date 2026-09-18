@@ -85,6 +85,63 @@ same false confidence the rest of this refuses to give.
 It also produces the distinction a test suite cannot: which checks carry the requirement, and
 which are regression guards that would pass either way.
 
+## An implementation agent's claim of completion is untrusted
+
+Everything here follows from one rule: **DONE is not declared by the implementation agent, it
+is derived from independently executable evidence.** That gives four questions a verdict has to
+answer, and each command exists to answer exactly one of them.
+
+| Question | Command | Failure it catches |
+| --- | --- | --- |
+| **Coverage** — does the contract represent every stated criterion? | `criteria:` / `satisfies:`, reported by `check` and `lint` | Four green checks about the happy path, and nothing about token expiry |
+| **Discrimination** — would the contract reject the code from before the change? | `falsify` | `expect: {status: 200}` on a route that already existed |
+| **Strength** — would it catch a plausible wrong implementation? | `challenge` | The endpoint answers, the guard it was supposed to have was never exercised |
+| **Integrity** — is this the contract that was agreed, and is the evidence about this code? | `seal`, `diff`, and the freshness rules in `done` | A check quietly relaxed until it passed |
+
+`proof done` is where the four meet, and it runs nothing itself: every input is a record an
+earlier command wrote, each stamped with the commit and the contract hash it was produced
+under. Evidence never carries across a change to the contract — a verdict recorded under a
+different definition of "done" is evidence about something else.
+
+The fault probes are deliberately the ones you write down rather than generated mutations. A
+syntactic mutation (`>` becomes `>=`) is cheap to produce and rarely describes anything a
+requirement cares about; "allow the token to be reused" does. `challenge --from <command>` is
+the seam for anything smarter — a semantic prober derived from a criterion, an adversarial
+agent hypothesising how the change could be wrong, a language-specific mutation tool. Whatever
+proposes the faults, proof is what applies them and decides whether the contract noticed. A
+model can strengthen verification; it is never the root of trust.
+
+## An attack is asymmetric, and says so
+
+`proof attack` can never prove an implementation correct, and nothing it prints pretends
+otherwise. It does not have to: one reproducible scenario showing that a claim of correctness is
+unjustified is worth more than any number of runs that found nothing, and the asymmetry is the
+whole design.
+
+That is why the result model has five states rather than two, why a search that finds nothing
+reports its strategies, its candidate count and its seed instead of a verdict, and why a 5xx is
+a `COUNTEREXAMPLE_CANDIDATE` and never a `CLAIM_VIOLATION` — a defect is not the claim being
+broken, and only a deterministic invariant can say that it was.
+
+The finding worth the most is not a bug in the code:
+
+```
+IMPLEMENTATION  appears correct
+CONTRACT        passes
+REQUIREMENT     violated
+```
+
+Which is only findable because two judges are allowed to disagree. The contract oracle is the
+checks that carry the criterion, run against the app in the state the scenario left it. The
+requirement oracle is an invariant — one comparison, counted over what was observed. If the
+contract could also define what "violated" means, an attack could only ever rediscover what the
+contract already asserts, and the interesting half would be invisible by construction.
+
+A model may propose scenarios (`--from`) and may never establish one: the executor only runs
+actions the criterion declared, and only a deterministic oracle turns an observation into a
+finding. That is the same trust boundary the rest of this tool keeps, in the one place where it
+would be most tempting to give it up.
+
 ## The contract has to be readable
 
 The contract is the definition of "done", which makes it something a human reviews. A file

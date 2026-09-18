@@ -2,6 +2,30 @@
 
 [← back to README](../README.md)
 
+## Five verdicts, not two
+
+| Verdict | Where | Means |
+| --- | --- | --- |
+| `PASS` / `FAIL` | per check | That check's own assertion held, or did not |
+| `DONE` | `proof check` | Every check in the whole contract passed, and every declared criterion has evidence in that run |
+| `NOT DONE` | `proof check` | At least one check failed |
+| `INCOMPLETE` | `proof check`, `proof done` | The checks may have passed, and the evidence does not add up to a completion claim: a subset run, a switched-off check, a criterion nothing verifies, a contract that moved after being sealed, a falsification that never happened |
+| `INVALID` | `proof done` | The chain cannot be trusted at all: evidence recorded for another commit or another contract, a baseline commit that no longer exists, a malformed run record |
+
+An attack has five of its own, because "we looked and found nothing" is not "it is correct":
+
+| Attack result | Means |
+| --- | --- |
+| `NO_COUNTEREXAMPLE_FOUND` | The budget ran out. The report states the strategies, the candidates evaluated and the seed |
+| `COUNTEREXAMPLE_CANDIDATE` | A server error, with no invariant broken — a defect, not an established claim violation |
+| `CLAIM_VIOLATION` | An invariant was broken, and the contract failed too |
+| `VERIFICATION_GAP` | An invariant was broken while the contract passed. The verifier itself was wrong |
+| `ATTACK_ERROR` | The scenario could not run, usually setup that did not succeed |
+
+`PASS` is not `DONE`, and `DONE` from `proof check` is a claim about the contract, not about
+the requirement. The claim about the requirement is `proof done`, which is derived from the
+records below rather than from any single run.
+
 ## What a green run does and does not mean
 
 If nothing in your contract exercises the running application, `proof check` says so on a pass:
@@ -125,9 +149,36 @@ OBSERVED BUT NOT GATED
 Detection is by content of tracked changes, so build output in a gitignored directory is
 not mistaken for an edit.
 
+Beside the runs, four records make up the verification chain. Each one is keyed by the contract
+it is about, so several contracts can share one `.proof` without overwriting each other:
+
+| File | Written by | Holds |
+| --- | --- | --- |
+| `lock.json` | `proof seal` | The contract's fingerprint, when it was sealed, at which commit, and a per-criterion and per-check hash so `proof diff` can say what moved |
+| `falsification.json` | `proof falsify` | The baseline commit, the contract it was run against, which checks failed there and which criteria that falsified |
+| `challenges.json` | `proof challenge` | Which faults were detected, which were missed, which were inconclusive, and which checks caught each one |
+| `attacks.json` | `proof attack` | The search: its seed, the contract and tree it ran against, what each criterion's search evaluated, and every gap, violation and counterexample it produced |
+| `report.json` | `proof done` | The manifest: the verdict, the commit, the contract hash, per-criterion coverage, the falsification result, the challenge outcome, the policy and every reason the verdict is not `DONE` |
+| `counterexamples/` | `proof challenge`, `proof attack` | One file per thing the contract accepted: a fault (the command that broke the code unnoticed) or a scenario (the steps, the invariant, what both oracles said, and the seed). `proof replay` runs a scenario again, `proof promote` turns either into a check |
+
+`lock.json` is meant to be committed: it is what says this contract was reviewed, and a seal
+only the person who wrote it can see is not a seal. The other three are records of a particular
+run against a particular commit — commit them for an audit trail, or ignore them; nothing in
+proof needs them to be in git.
+
+Evidence never carries across a change to the contract. Every record holds the contract hash
+it was produced under, and `proof done` refuses one that does not match the contract on disk:
+a verdict recorded under a different definition of "done" is evidence about something else.
+
 ```
 .proof/
 ├── spec.yaml
+├── lock.json                          `proof seal`: the contract as it was reviewed
+├── falsification.json                 `proof falsify`: the baseline and what failed there
+├── challenges.json                    `proof challenge`: which faults the contract caught
+├── attacks.json                       `proof attack`: what was searched, and what it found
+├── report.json                        `proof done`: the verification manifest
+├── counterexamples/                   faults the contract accepted, kept
 └── runs/
     └── 0001/
         ├── result.json                    every check, what it asserted, timing, git context

@@ -52,6 +52,124 @@ checks:
         - expect_url: /dashboard
 ```
 
+### Criteria — what the checks are evidence for
+
+A check asserts one thing. A requirement is usually several, and a contract made only of
+checks cannot say which of them it covers. `criteria:` names them, and `satisfies:` on a check
+says that check is the evidence for one:
+
+```yaml
+goal: Users can reset a forgotten password and log in with the new one
+
+serve:
+  run: npm run dev
+  ready_url: http://localhost:3000
+
+criteria:
+  - id: AC1
+    requirement: a reset link is emailed
+    source: issue#143
+  - id: AC2
+    requirement: a reset token cannot be reused
+    source: {type: github_issue, reference: "#143"}
+checks:
+  - name: reset endpoint
+    satisfies: [AC1]
+    http: {method: POST, path: /api/password-reset, body: {email: user@example.com}, expect: {status: 200, json: {ok: true}}}
+  - name: a used token is refused
+    satisfies: AC2
+    http: {method: POST, path: /api/password-reset/used-token, expect: {status: 401}}
+```
+
+| Key | Means |
+| --- | --- |
+| `criteria[].id` | How checks refer to it: letters, digits, dot, dash and underscore, starting with a letter. Unique within the contract |
+| `criteria[].requirement` | The requirement in words. It is what the coverage report reads back, so write it as a statement about behaviour |
+| `criteria[].source` | Optional provenance: free text, or `{type, reference}` — an issue, a ticket, a spec file, a conversation |
+| `checks[].satisfies` | One criterion id, or a list of them |
+
+Criteria are optional; a contract without them behaves exactly as it always has. With them, a
+criterion nothing points at makes every run `INCOMPLETE` — see
+[requirement coverage](commands.md#requirement-coverage).
+
+### Attack — what may be manipulated, and what must stay true
+
+A criterion can say what an attack is allowed to do to the running app, and what must remain
+true while it does. `proof attack` then searches for a scenario that satisfies the contract and
+breaks the claim.
+
+```yaml
+criteria:
+  - id: AC3
+    requirement: a reset token cannot be redeemed twice
+    attack:
+      surfaces: [concurrency, sequence, input]
+      setup:
+        - name: issue
+          http: {method: POST, path: /issue}
+          capture: {token: json.token}
+      actions:
+        - name: redeem
+          http: {method: POST, path: /redeem, body: {token: "${token}"}}
+      invariants:
+        - successful_redeem <= 1
+      budget: {duration: 60, candidates: 50, concurrency: 4}
+      permissions: {network: same-origin}
+```
+
+| Key | Means |
+| --- | --- |
+| `setup` | Steps run before every scenario, so one candidate does not inherit the last one's state. They must succeed |
+| `actions` | The operations an attack composes: `{name, http}` or `{name, run}`, with an optional `capture`. No `expect` — an attack observes, it does not assert |
+| `invariants` | What must remain true: one comparison, `<term> <op> <whole number>` |
+| `surfaces` | `input`, `sequence`, `concurrency`. Naming one proof cannot drive is refused rather than ignored |
+| `budget` | `duration` (seconds), `candidates`, `concurrency`. `--budget 5m` overrides the duration |
+| `permissions` | `network: same-origin` by default; `any` to allow an action pointed at another host |
+
+Invariant terms are counted over the steps that ran: `successes`, `failures`, `steps`,
+`successful_<action>`, `failed_<action>`, `status_<code>`, `status_2xx`, `status_4xx`,
+`status_5xx`. A step counts as successful when the operation actually happened — a status below
+400, or exit 0.
+
+The invariant is the requirement oracle, and it is the reason an attack can find something the
+contract cannot: the contract says whether the checks pass, the invariant says whether the claim
+held, and a scenario where those two disagree is a hole in the contract. See
+[attacking a claim](commands.md#attacking-a-claim).
+
+### Challenges — the faults the contract has to catch
+
+```yaml
+challenges:
+  - name: allow token reuse
+    breaks: [AC2]
+    apply: "sed -i 's/markTokenUsed(token)//' src/reset.js"
+```
+
+| Key | Means |
+| --- | --- |
+| `challenges[].name` | The fault in words. It names the row in the report and the counterexample file |
+| `challenges[].apply` | The command that introduces it, run against a throwaway copy of your code |
+| `challenges[].breaks` | Optional: the criterion id(s) this fault violates, so a detection can be attributed to a requirement |
+
+`proof challenge` runs each one. Nothing touches your working tree. See
+[challenging the contract](commands.md#challenging-the-contract).
+
+### Policy — how much evidence `done` requires
+
+```yaml
+policy:
+  require_criteria_coverage: true         # default
+  require_criteria_falsification: false
+  require_falsification: true             # default
+  require_sealed_contract: false
+  require_challenges: false
+  allow_flakes: false                     # default
+  allow_skipped: false                    # default
+```
+
+Every key is a yes/no, and the whole block is optional. It is read only by `proof done` —
+`check` reports what happened either way. See [the completion gate](commands.md#the-completion-gate).
+
 ### Verbs
 
 | Verb | Shape | Notes |
