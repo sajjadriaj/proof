@@ -324,18 +324,21 @@ OpenAPI document. `changed` builds its import graph from JavaScript, TypeScript,
 Go. More worked examples — a Go API, a data pipeline, database migrations, a security fix, a
 browser flow with sessions: [docs/examples.md](docs/examples.md).
 
-## Don't trust the contract either
+## Four questions a passing run does not answer
 
-A contract is only worth the verdict it gives, and the way a contract goes wrong is silent: it
-passes on code that never had the feature. `expect: {status: 200}` on a route that already
-existed proves nothing, and nothing in a green run tells you that.
+`proof check` says the checks passed — a claim about the checks, not about the requirement.
+Each question below has one command, and `proof done` is where they meet.
 
-```bash
-proof falsify
-```
+| Question | Command | What it catches |
+| --- | --- | --- |
+| Does the contract cover the whole requirement? | `criteria:` + `satisfies:`, reported by `check` and `lint` | Four green checks about the happy path, and nothing about token expiry |
+| Would it fail on the code from before the change? | `proof falsify` | `expect: {status: 200}` on a route that already existed |
+| Would it catch a wrong implementation? | `proof challenge` | The endpoint answers; the guard it was supposed to have is never exercised |
+| Is there a way to be wrong that it would accept? | `proof attack` | Two requests at once, where the contract only ever asked twice in a row |
+| Is this still the contract that was agreed? | `proof seal`, `proof diff` | A check quietly relaxed until it passed |
 
-It checks out the commit your change started from, runs the **current** contract against it,
-and reports whether anything failed:
+**Discrimination.** `proof falsify` checks out the commit your change started from, runs the
+**current** contract against it, and reports what failed. Your working tree is never touched:
 
 ```
 VERDICT
@@ -345,137 +348,42 @@ VERDICT
 ```
 
 If every check passes there, the contract would report `DONE` for a branch that did nothing —
-and it says so, and exits 1. If it failed only because the old checkout would not boot, it says
-`INCONCLUSIVE` rather than claiming a discrimination it did not observe.
+and it says so, and exits 1. It is red-before-green for acceptance criteria, made mechanical.
 
-This is red-before-green for acceptance criteria, made mechanical. Your working tree is never
-touched.
-
-## Did the contract cover the whole requirement?
-
-A contract can be completely valid and still say nothing about half of what was asked for.
-"Implement secure password reset" becomes four checks about the happy path, all four pass, and
-token expiry, single use and account enumeration were never verified at all. Passing checks are
-evidence for whatever the checks happen to assert — which is not the same as evidence for the
-requirement.
-
-So write the requirement down as criteria, and say which check is evidence for each:
+**Coverage.** Name what was asked for, and say which check is evidence for each part:
 
 ```yaml
-goal: secure password reset
-
-serve:
-  run: npm run dev
-  ready_url: http://localhost:3000
-
+goal: a user can reset a forgotten password, safely
 criteria:
-  - id: AC1
-    requirement: the reset link is emailed
-    source: issue#143
-  - id: AC2
-    requirement: a reset token expires after 30 minutes
-    source: {type: github_issue, reference: "#143"}
   - id: AC3
     requirement: a reset token cannot be reused
-  - id: AC4
-    requirement: the reset flow does not reveal whether an account exists
-    source: security-requirements.md
+    source: issue#143
 checks:
-  - name: a reset link is emailed
-    satisfies: [AC1]
-    http: {method: POST, path: /api/password-reset, body: {email: ada@example.com}, expect: {status: 200, json: {sent: true}}}
-  - name: an expired token is refused
-    satisfies: [AC2]
-    http: {method: POST, path: /api/password-reset/expired-token, expect: {status: 401}}
-  - name: a token cannot be used twice
+  - name: a used token is refused
     satisfies: [AC3]
-    http: {method: POST, path: /api/password-reset/used-token, expect: {status: 401}}
+    run: npm run test:reset-reuse
 ```
 
-`proof check` then answers a question no test suite asks — *is every criterion backed by
-evidence?*
+A criterion nothing points at makes the run `INCOMPLETE` however green it is — passing checks
+are evidence for what the checks assert, not for what was asked for.
+
+**Attack.** The strongest finding here is not a bug, it is a hole in the verification:
 
 ```
-REQUIREMENT COVERAGE
-  AC1  the reset link is emailed                        VERIFIED
-  AC2  a reset token expires after 30 minutes           VERIFIED
-  AC3  a reset token cannot be reused                   VERIFIED
-  AC4  the reset flow does not reveal whether an accou…  UNCOVERED
-
-VERDICT
-  INCOMPLETE — this run does not make a completion claim
-  3 passed, 3/4 criteria verified
+VERIFICATION GAP  AC3
+  2 concurrent redeem requests may all succeed
+  Invariant:  successful_redeem <= 1
+  Observed:   successful_redeem was 2
+  Contract:   redeeming the same token again is refused: PASSED
 ```
 
-Every check passed, and the verdict is still `INCOMPLETE`: `AC4` has no check pointing at it,
-so nothing in that run is evidence for it. `proof lint` says the same thing from the file
-alone, before a run is spent on it.
-
-## Would the contract catch a wrong implementation?
-
-`falsify` asks whether the contract tells the old code from the new. It does not ask whether
-the contract would notice a version of the change that is *wrong*. Write down the ways it could
-be, and `proof challenge` injects each one into a throwaway copy of your code and runs the
-contract against it:
+The contract asked twice in a row and got its `401`. Two at once both got `200`. Finding that
+needs two judges able to disagree — the checks that carry the criterion, and an invariant
+counting what actually happened — so a criterion can declare what a search may compose:
 
 ```yaml
-challenges:
-  - name: allow token reuse
-    breaks: [AC3]
-    apply: "sed -i 's/markTokenUsed(token)//' src/reset.js"
-  - name: remove the authorization guard
-    breaks: [AC4]
-    apply: "sed -i 's/requireSession()//' src/routes.js"
-```
-
-```
-FAULT                                        DETECTION
-  allow token reuse                 DETECTED  a token cannot be used twice
-  remove the authorization guard    MISSED
-
-WEAKNESS
-  remove the authorization guard — the contract passed with this fault applied, so it cannot
-  report this class of wrong implementation.
-
-  .proof/counterexamples/remove-the-authorization-guard.yaml
-```
-
-A fault the contract accepts is kept as a counterexample, and `proof promote <id>` turns one
-into a check — with the fault recorded above it and proof's own placeholder as the command, so
-`proof check` refuses the contract until you write the assertion that catches it. The contract
-gets stronger every time it is caught being weak.
-
-Nothing is generated by a model. The faults are the ones you name — or the ones any program
-prints for you: `proof challenge --from "./propose-faults.sh"` reads `{name, apply, breaks}`
-objects from a command's stdout, which is where an adversarial agent, a semantic prober or a
-language-specific mutation tool plugs in. Whatever proposes them, `proof` is what executes and
-judges them.
-
-## Can I make your verifier believe you are done?
-
-`challenge` asks whether the contract catches faults **you thought of**. `proof attack` goes
-looking for the ones you did not — and its most valuable finding is not a bug in the code, it is
-a hole in the verification:
-
-```
-IMPLEMENTATION  appears correct
-CONTRACT        passes
-REQUIREMENT     violated
-```
-
-To find that, an attack needs two judges that can disagree: the checks that carry a criterion,
-and the claim itself, written as something countable about what happened.
-
-```yaml
-criteria:
-  - id: AC3
-    requirement: a reset token cannot be redeemed twice
     attack:
       surfaces: [concurrency, sequence]
-      setup:
-        - name: issue
-          http: {method: POST, path: /issue}
-          capture: {token: json.token}
       actions:
         - name: redeem
           http: {method: POST, path: /redeem, body: {token: "${token}"}}
@@ -483,122 +391,31 @@ criteria:
         - successful_redeem <= 1
 ```
 
-`actions` are the operations an attack may compose. `invariants` are what must remain true while
-it does. Proof then builds scenarios out of those actions — the same one twice, two of them at
-once, one of them with a field that is empty, negative, enormous or the wrong type — and after
-each one it asks both judges:
+Findings are minimized, kept as counterexamples, and `proof replay ce-…` re-runs one until it
+stops reproducing. `proof promote ce-…` turns it into a permanent check — every successful
+attack leaves the contract stronger than the one that accepted it. A search that finds nothing
+reports its strategies, candidate count and seed; it never reports correctness.
+
+**The gate.** `proof done` runs nothing. It reads the records the other commands wrote — each
+stamped with the commit and contract hash it was produced under — and answers the only question
+that matters, non-zero unless the answer is `DONE`:
 
 ```
-$ proof attack
-
-VERIFICATION GAP  AC3
-  2 concurrent redeem requests may all succeed
-  Invariant:
-    successful_redeem <= 1
-  Observed:
-    successful_redeem was 2
-  Contract:
-    redeeming the same token again is refused: PASSED
-  The checks that carry this criterion passed while it was violated — the contract cannot
-  see this, which is why the run says so here rather than in a verdict.
-  Counterexample:
-    .proof/counterexamples/ce-17f09e06.yaml
-
-SEARCH
-  strategies: concurrency, sequence
-  candidates evaluated: 1
-  seed: 1974540407 (`--seed 1974540407` runs this search again)
+Criteria                4/4 VERIFIED
+Checks                  9/9 PASS (run 0012)
+Falsification           PASS
+Challenges              COMPLETE
+Attack                  COMPLETE — no counterexample found
+Evidence                CURRENT
+VERDICT  DONE
 ```
 
-The contract asked twice in a row and got a `401`, exactly as written. Two requests at once both
-got `200`. Nothing in `proof check` could have told you that.
+How much of that chain is required is the project's to choose (`policy: {require_attack: true}`
+and friends). `INCOMPLETE` means the evidence is not there yet; `INVALID` means it is about
+another commit or another contract.
 
-A finding is minimized (the smallest scenario that still breaks the claim), kept as a
-counterexample, and replayable:
-
-```bash
-proof replay ce-17f09e06     # exit 1 while it still reproduces, 0 once it is fixed
-proof promote ce-17f09e06    # and now it is a permanent check in the contract
-```
-
-That is the loop worth having: every attack that succeeds leaves the contract stronger than the
-one that accepted it.
-
-**It never claims correctness.** A search that finds nothing reports what it tried, how many
-scenarios it evaluated, and its seed — `NO COUNTEREXAMPLE FOUND`, never "no bugs". Five outcomes,
-not two: `NO_COUNTEREXAMPLE_FOUND`, `COUNTEREXAMPLE_CANDIDATE` (a 500 is a defect, not a proven
-claim violation), `CLAIM_VIOLATION` (the contract caught it too), `VERIFICATION_GAP` (it did
-not), `ATTACK_ERROR`.
-
-**Nothing is generated by a model.** The strategies are deterministic and seeded, the requirement
-oracle is a comparison you wrote, and `proof attack --from "./propose.sh"` is where an
-adversarial agent plugs in: it proposes `{hypothesis, steps}` built from *declared* actions,
-proof executes and judges. A hypothesis is not evidence.
-
-## Is this still the contract that was agreed?
-
-An agent that cannot make a check pass can edit the check. `proof seal` fingerprints the
-contract so that stops being invisible:
-
-```bash
-proof seal      # Contract sealed. SHA256: 7fd84b…
-```
-
-After that, a run whose contract no longer matches the seal reports `INCOMPLETE` and says so,
-`proof diff` shows what moved, and `proof seal` accepts the new one. Nothing is forbidden —
-requirements change — but the previous verification chain does not silently carry over:
-
-```
-CONTRACT CHANGES since 7fd84b9c2a11 (sealed 2025-03-02T11:04:19Z)
-
-  + AC9
-  ~ AC3
-  - check "the legacy endpoint answers"
-
-VERIFICATION AFFECTED
-  AC9   UNVERIFIED
-  AC3   REVERIFY
-```
-
-## `proof done` — the completion gate
-
-`proof check` reports what the contract did. `proof done` reports whether the evidence justifies
-calling the work finished, and it is the one command CI and an agent loop need:
-
-```
-$ proof done
-
-  Implementation          abc123def456
-  Contract                SEALED
-  Criteria                4/4 VERIFIED
-  Checks                  9/9 PASS (run 0012)
-  Falsification           PASS
-  Challenges              COMPLETE
-  Flakes                  NONE
-  Evidence                CURRENT
-
-VERDICT
-  DONE
-```
-
-It exits non-zero unless the verdict is `DONE`, and writes `.proof/report.json` — the manifest:
-the commit, the contract hash, per-criterion coverage, the falsification baseline, which faults
-were detected and which were missed. How much of that chain is required is the project's to
-choose:
-
-```yaml
-policy:
-  require_criteria_coverage: true    # default
-  require_falsification: true        # default
-  require_sealed_contract: false
-  require_challenges: false
-  allow_flakes: false                # default
-  allow_skipped: false               # default
-```
-
-`INCOMPLETE` means the evidence is not there yet. `INVALID` means the chain cannot be trusted at
-all — evidence recorded for another commit, a contract that moved after being sealed under a
-policy that requires one, a baseline commit that no longer exists.
+Full syntax, strategies, budgets, seeds and boundaries:
+[docs/commands.md](docs/commands.md) · [docs/contract.md](docs/contract.md).
 
 ## A verdict that means something
 
