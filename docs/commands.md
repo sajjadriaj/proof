@@ -161,6 +161,15 @@ of those makes the contract "fail", and reporting that as *discriminates* would 
 false confidence the rest of this tool refuses to give. Those failures are excluded from the
 evidence and named separately.
 
+**A failed precondition is one of them.** A contract's opening checks are usually not claims:
+they sign somebody in, seed a row, start a fixture, and hand an id to everything below. When one
+of those fails on the base commit, every check after it fails for want of a value — and the run
+reads as a contract that discriminates beautifully, when what happened is that the base never
+reached the state the contract is about. A check that captures a variable another check uses is
+treated as a precondition, and its failure makes the run `INCONCLUSIVE` rather than evidence.
+The fix is to seed in a way that runs on both commits — SQL, or a fixture that predates the
+change — rather than in code the base does not have yet.
+
 Two things are worth knowing about how the base is prepared:
 
 - **`node_modules`, `.venv`, `venv` and `vendor` are linked from your working tree**, not

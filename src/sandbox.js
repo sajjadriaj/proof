@@ -115,4 +115,12 @@ export function runContract(cwd, absoluteSpec, { label } = {}) {
  * checkout missing a build step is the environment rather than the requirement. Counting
  * either as evidence would let a contract that tests nothing look like one that works.
  */
-export const isSuspicious = r => Boolean(r.crashed) || r.exit_code === 127
+/**
+ * A failure that says nothing about the change.
+ *
+ * A crashed runner never reached the code; a command that exits 127 was not there to run; and
+ * a check marked `unmet` never ran at all, because a value it needed was never captured. None
+ * of the three is evidence that the base commit lacks the change — they are evidence that the
+ * measurement did not happen.
+ */
+export const isSuspicious = r => Boolean(r.crashed) || r.exit_code === 127 || Boolean(r.unmet)

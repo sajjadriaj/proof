@@ -80,7 +80,9 @@ proof falsify
   before the change, so the contract would report DONE for a branch that did nothing. This is the
   single most common failure and it is always the same cause: you asserted that an endpoint
   *answered* rather than what it *returned*. Go back to step 1.
-- `INCONCLUSIVE` — the base commit would not run, so the question was not answered. Read the
+- `INCONCLUSIVE` — the base commit would not run, or a check the rest of the contract captures
+  from failed there, so the question was not answered. Seed state in a way that runs on both
+  commits and try again. Read the
   reason; do not treat it as a pass.
 
 **4 · Implement.**

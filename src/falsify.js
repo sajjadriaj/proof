@@ -111,6 +111,45 @@ export function criteriaFalsification(spec, contractChecks) {
 }
 
 /**
+ * Checks the rest of the contract depends on, which failed on the base commit.
+ *
+ * A contract's opening steps are usually not claims at all. They sign somebody in, seed a row,
+ * start a fixture, and hand an id to everything below. When one of those fails on the base
+ * commit every check after it fails for want of a value — and the run reads as a contract that
+ * discriminates beautifully, when what actually happened is that the base never reached the
+ * state the contract is about. It proved nothing.
+ *
+ * That is the exact shape of a false DISCRIMINATES, and it is the worst thing this command can
+ * produce: falsification is the step that exists to stop somebody fooling themselves, so a
+ * confident wrong answer here is worse than no answer. Two real contracts hit it — one reported
+ * "18 of 18 check(s) fail without your change" where the fixture had exited 1 and the other
+ * seventeen failed with `no value for ${api_key}`.
+ *
+ * A check is a precondition when it captures a variable that any check uses. Its own failure is
+ * then a statement about the harness, not about the change.
+ */
+export function failedPreconditions(spec, contractChecks) {
+  const checks = Array.isArray(spec.checks) ? spec.checks : []
+  const produced = new Map()
+  for (const c of checks) {
+    for (const name of Object.keys(c?.capture ?? {})) produced.set(name, c?.name)
+  }
+  if (!produced.size) return []
+
+  // Referenced anywhere in the contract, read off the serialized check so a `${var}` inside a
+  // header, a body, a path or a shell command all count the same.
+  const used = new Set()
+  for (const c of checks) {
+    for (const [, name] of JSON.stringify(c ?? {}).matchAll(/\$\{([A-Za-z0-9_]+)\}/g)) used.add(name)
+  }
+
+  const failed = new Set(contractChecks.filter(r => r.status === 'failed').map(r => r.name))
+  return [...new Set([...produced]
+    .filter(([name, producer]) => used.has(name) && failed.has(producer))
+    .map(([, producer]) => producer))]
+}
+
+/**
  * What the base run means.
  *
  * Three answers, not two. A contract that failed because the app never started on the base
@@ -166,6 +205,19 @@ export function classify(run, { spec, specPath = SPEC_PATH, base, from, commit, 
   }
   if (!contractChecks.length) {
     return { ...common, status: 'inconclusive', reason: 'no check ran against the base commit' }
+  }
+  // Before any verdict about the change: if the contract could not get the base into the state
+  // it asserts against, nothing below that point is evidence either way.
+  const unmet = failedPreconditions(spec, contractChecks)
+  if (unmet.length) {
+    return {
+      ...common,
+      status: 'inconclusive',
+      reason: `${unmet.join(', ')} failed on ${commit.slice(0, 12)}, and the rest of the contract`
+        + ' captures values from it — so the checks after it failed for want of a value rather than'
+        + ' for want of your change. Seed the state in a way that runs on both commits (SQL or a'
+        + ' fixture that predates the change) and falsify again',
+    }
   }
   if (evidence.length) {
     return { ...common, status: 'discriminates', reason: null }
