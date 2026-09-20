@@ -172,10 +172,21 @@ export async function stopHook({ maxAttempts = DEFAULT_MAX_ATTEMPTS, specPath } 
   }
 
   writeFileAtomic(STATE, JSON.stringify({ attempts: attempt, run: result.run ?? null }))
-  const failed = (result.failures ?? []).map(f => f.check).join(', ')
+  // Lead with what actually failed. A check that never ran — because a value it needed was
+  // never captured — is a consequence, and counting it alongside the cause turns one broken
+  // fixture into "18 check(s) failed" followed by seventeen identical lines. The agent reading
+  // this has to find the one sentence that matters, and the summary should hand it over.
+  const all = result.failures ?? []
+  const real = all.filter(f => !f.unmet)
+  const cascaded = all.length - real.length
+  const named = (real.length ? real : all).map(f => f.check).join(', ')
+  const tail = cascaded && real.length
+    ? `, and ${cascaded} more could not run without it`
+    : ''
   console.log(JSON.stringify({
     decision: 'block',
-    reason: `proof check: NOT DONE (attempt ${attempt} of ${maxAttempts}) — ${result.failures?.length ?? '?'} check(s) failed: ${failed}.\n\n${feedback}`,
+    reason: `proof check: NOT DONE (attempt ${attempt} of ${maxAttempts}) — ${real.length || all.length}`
+      + ` check(s) failed: ${named}${tail}.\n\n${feedback}`,
   }))
   return 0
 }
