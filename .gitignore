@@ -5,6 +5,7 @@ node_modules/
 .proof/runs/
 .proof/feedback.md
 .proof/hook-state.json
+.proof/run.lock
 .proof/spec.lock
 .proof/*.tmp
 .proof/*.bak
