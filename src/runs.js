@@ -95,7 +95,7 @@ export const FLAKY_NOTICE = '{check} has not agreed with itself: it failed {fail
   + ' it appears in weaker — find the nondeterminism, or make the check wait for what it needs.'
 
 /**
- * Checks whose history contains both outcomes for the same assertion.
+ * Checks whose history contains both outcomes for the same assertion, on the same code.
  *
  * Drawn from the history *before* this run, never including it: a check that passed ten times
  * and fails now is a regression, and calling that a flake would excuse the change that caused
@@ -103,14 +103,34 @@ export const FLAKY_NOTICE = '{check} has not agreed with itself: it failed {fail
  *
  * Like-for-like or not at all — the same rule the regression marker follows. A check whose
  * assertion was edited is a different check, and its earlier outcomes say nothing about it.
+ *
+ * SAME CODE, and that is the third half of like-for-like. A run against a different working
+ * tree is a different experiment, and a check that answered differently there disagreed with a
+ * different program, not with itself. Without this the tool punished the sequence it exists to
+ * teach: write the contract, run it, watch it FAIL because the feature is not built yet, then
+ * build it. Base and head carry the same commit while the work is uncommitted, so that first
+ * honest failure sat in the ledger forever and every later run of that contract reported a
+ * flake. The only escapes were destroying evidence or editing the contract, and the tool
+ * forbids the second.
+ *
+ * `tree` is HEAD plus a hash of the tracked modifications (see git.fingerprint), so it moves
+ * the moment the code does and ignores build output. A run recorded before proof kept one has
+ * no `tree`; those are skipped rather than guessed at, because "unknown code" is not evidence
+ * that a check disagrees with itself.
+ *
+ * Outside a repository there is no fingerprint to compare — `fingerprint()` needs a HEAD. The
+ * comparison is then dropped rather than the detection: no git means no uncommitted-work trap
+ * to avoid either, and a flake ledger that silently stopped working outside a repo would be a
+ * worse bug than the one this guard fixes.
  */
-export function flakiness(history, results) {
+export function flakiness(history, results, tree = null) {
   const out = []
   for (const r of results) {
     if (r.kind === 'serve' || !r.asserted) continue
     let passed = 0
     let failed = 0
     for (const { result } of history) {
+      if (tree && result.tree !== tree) continue
       const past = (result.results ?? []).find(p => p?.name === r.name && p?.asserted === r.asserted)
       if (past?.status === 'passed') passed++
       else if (past?.status === 'failed') failed++

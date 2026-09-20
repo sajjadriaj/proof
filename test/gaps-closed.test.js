@@ -185,29 +185,75 @@ test('a base URL that cannot be fetched is refused before anything runs', async 
 
 // --- flakiness ---------------------------------------------------------------
 
+// `tree` is HEAD plus a hash of the tracked modifications. History from another tree is
+// another experiment, so every case here has to name the one it is talking about.
+const TREE = 'abc123:deadbeef'
+
 test('a check whose history holds both outcomes is named', () => {
   const history = ['passed', 'failed', 'passed', 'passed'].map((status, i) => ({
     id: String(i),
-    result: { results: [{ name: 'a', asserted: 'X', status }] },
+    result: { tree: TREE, results: [{ name: 'a', asserted: 'X', status }] },
   }))
-  assert.deepEqual(flakiness(history, [{ name: 'a', kind: 'run', asserted: 'X', status: 'passed' }]),
+  assert.deepEqual(
+    flakiness(history, [{ name: 'a', kind: 'run', asserted: 'X', status: 'passed' }], TREE),
     [{ check: 'a', failed: 1, of: 4 }])
 })
 
 test('a regression is not a flake, and an edited check is not comparable', () => {
   const allPassed = ['passed', 'passed'].map((status, i) => ({
     id: String(i),
-    result: { results: [{ name: 'a', asserted: 'X', status }] },
+    result: { tree: TREE, results: [{ name: 'a', asserted: 'X', status }] },
   }))
   // Passed every time and fails now: that is the change's fault, and calling it a flake
   // would excuse it.
-  assert.deepEqual(flakiness(allPassed, [{ name: 'a', kind: 'run', asserted: 'X', status: 'failed' }]), [])
+  assert.deepEqual(
+    flakiness(allPassed, [{ name: 'a', kind: 'run', asserted: 'X', status: 'failed' }], TREE), [])
 
   const mixed = ['passed', 'failed'].map((status, i) => ({
     id: String(i),
-    result: { results: [{ name: 'a', asserted: 'OLD', status }] },
+    result: { tree: TREE, results: [{ name: 'a', asserted: 'OLD', status }] },
   }))
-  assert.deepEqual(flakiness(mixed, [{ name: 'a', kind: 'run', asserted: 'NEW', status: 'passed' }]), [])
+  assert.deepEqual(
+    flakiness(mixed, [{ name: 'a', kind: 'run', asserted: 'NEW', status: 'passed' }], TREE), [])
+})
+
+test('a run against different code is not evidence that a check disagrees with itself', () => {
+  // The sequence this tool teaches: write the contract, run it, watch it FAIL because the
+  // feature is not built, then build it. Base and head carry the same COMMIT while the work
+  // is uncommitted, so without comparing the working tree that first honest failure sat in
+  // the ledger forever and every later run of the contract reported a flake. The only ways
+  // out were destroying evidence or editing the contract, and the tool forbids the second.
+  const before = { id: '0', result: { tree: 'abc123:beforehash', results: [{ name: 'a', asserted: 'X', status: 'failed' }] } }
+  const after = ['passed', 'passed'].map((status, i) => ({
+    id: String(i + 1),
+    result: { tree: TREE, results: [{ name: 'a', asserted: 'X', status }] },
+  }))
+  assert.deepEqual(
+    flakiness([before, ...after], [{ name: 'a', kind: 'run', asserted: 'X', status: 'passed' }], TREE),
+    [], 'the pre-implementation failure was on other code and is not a flake')
+})
+
+test('a run recorded before proof kept a tree is skipped rather than guessed at', () => {
+  const old = ['passed', 'failed'].map((status, i) => ({
+    id: String(i),
+    result: { results: [{ name: 'a', asserted: 'X', status }] },
+  }))
+  assert.deepEqual(
+    flakiness(old, [{ name: 'a', kind: 'run', asserted: 'X', status: 'passed' }], TREE),
+    [], '"unknown code" is not evidence that a check disagrees with itself')
+})
+
+test('outside a repository the comparison is dropped, not the detection', () => {
+  // `fingerprint()` needs a HEAD, so a project with no git has no tree on any run. A ledger
+  // that silently stopped working there would be a worse bug than the one the tree comparison
+  // fixes — and with no commits there is no uncommitted-work trap to avoid in the first place.
+  const history = ['passed', 'failed'].map((status, i) => ({
+    id: String(i),
+    result: { results: [{ name: 'a', asserted: 'X', status }] },
+  }))
+  assert.deepEqual(
+    flakiness(history, [{ name: 'a', kind: 'run', asserted: 'X', status: 'passed' }], null),
+    [{ check: 'a', failed: 1, of: 2 }])
 })
 
 test('a flaky check is reported on a green run, where the false confidence is', async () => {

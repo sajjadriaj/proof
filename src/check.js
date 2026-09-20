@@ -14,6 +14,7 @@ import { jsonMismatch } from './json-match.js'
 import { substitute, captureValue } from './vars.js'
 import { parseJUnit, describeFailures } from './junit.js'
 import { TERMINAL_WIDTH, padTo, truncateToWidth, wrap, block, columnWidth, ellipsize } from './terminal.js'
+import { acquire } from './runlock.js'
 
 export { TERMINAL_WIDTH } from './terminal.js'
 
@@ -1122,6 +1123,10 @@ async function runOne({ check: c, index }, ctx, vars, producedBy) {
       kind,
       asserted: describe(c, kind),
       ...fail(`the values this check uses are available`, `no value for ${missing.map(n => `\${${n}}`).join(', ')} — ${why.join('; ')}`),
+      // This check never ran. It failed because something it depends on did, and a summary
+      // that counts it alongside the real failure reports eighteen problems where there is
+      // one — the same reason a boot failure short-circuits the rest of the run.
+      unmet: true,
       ms: 0,
     }
   }
@@ -1194,6 +1199,28 @@ async function runOne({ check: c, index }, ctx, vars, producedBy) {
 }
 
 export async function check({ json = false, specPath, only, baseUrl: baseUrlOverride } = {}) {
+  // One run per project at a time — but only for a contract that starts something.
+  //
+  // Concurrent runs are a deliberate feature and each gets its own evidence directory (see
+  // test/concurrent-runs.test.js). A contract of pure `run:` checks owns no port and no build
+  // directory, so several at once are harmless. A contract with a `serve:` block owns both,
+  // and two of those destroy each other — see src/runlock.js.
+  //
+  // A contract that will not load is not locked: runCheck below produces the real error, and a
+  // lock failure here would replace it with a worse one.
+  let serves = []
+  try { serves = serveList(loadSpec(specPath)) } catch { /* runCheck reports it properly */ }
+  const release = serves.length
+    ? acquire({ spec: specPath ?? SPEC_PATH, command: 'check' })
+    : () => {}
+  try {
+    return await runCheck({ json, specPath, only, baseUrl: baseUrlOverride })
+  } finally {
+    release()
+  }
+}
+
+async function runCheck({ json = false, specPath, only, baseUrl: baseUrlOverride } = {}) {
   const spec = loadSpec(specPath)
 
   // A contract still holding one of proof's own placeholders is unfinished, and an
@@ -1402,7 +1429,7 @@ export async function check({ json = false, specPath, only, baseUrl: baseUrlOver
   // Evidence proof already had and never read: every run of this contract is on disk, and the
   // only one ever consulted was the last. A check that passes four runs in five rendered
   // exactly like one that always passes.
-  const flaky = flakiness(history, results)
+  const flaky = flakiness(history, results, treeBefore)
 
   const appStarted = serves.length > 0 && !serveSkipped
   // Not on a subset run. Every advisory is a statement about what the whole contract proves,
@@ -1508,12 +1535,15 @@ export async function check({ json = false, specPath, only, baseUrl: baseUrlOver
     // Always all five keys. JSON.stringify drops undefined, so a failure with no output
     // used to lose the field entirely — and an agent reading failure.output would crash
     // on exactly the failures that carry the least context.
-    failures: failures.map(({ name, expected, observed, output, evidence }) => ({
+    failures: failures.map(({ name, expected, observed, output, evidence, unmet }) => ({
       check: name,
       expected: expected ?? null,
       observed: observed ?? null,
       output: output ?? null,
       evidence: evidence ?? null,
+      // True when the check never ran: a value it needed was never captured, because the
+      // check that produces it failed. A cause, not a problem of its own.
+      unmet: Boolean(unmet),
       // "You broke this" and "you have not finished this" render identically without it, and
       // only one of them is about the change just made.
       was: comparableStatus(previously.get(name), assertedBy.get(name)),

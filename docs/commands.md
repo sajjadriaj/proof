@@ -706,7 +706,7 @@ string is a parser nobody should have to write against a tool built for agents.
 | `criteria` | `{id, requirement, source, checks, status}` per declared acceptance criterion: which checks are evidence for it and what this run says about them. `status` is `verified`, `failed`, `unverified` or `uncovered`. An `uncovered` one makes the run `partial` |
 | `contract_hash` | Fingerprint of the contract this verdict is about. Evidence never carries across a change to it |
 | `contract_integrity` | `valid`, `modified` or `unsealed` — whether the contract still matches `proof seal`. `modified` makes the run `partial` |
-| `flaky` | `{check, failed, of}` for each check whose recent history holds both outcomes for the same assertion |
+| `flaky` | `{check, failed, of}` for each check whose recent history holds both outcomes for the same assertion **on the same code**. History is compared by `tree` (HEAD plus a hash of the tracked modifications), so a run against a different working tree is a different experiment and does not count — without that, the first honest failure of a contract written before its implementation would sit in the ledger forever, because base and head share a commit while the work is uncommitted. Outside a git repository there is no fingerprint, and the comparison is dropped rather than the detection |
 | `against` | The URL `--base-url` pointed the run at, or `null` when proof started the app itself |
 | `advisory` | Set when a passing run proves less than it appears to, otherwise `null` |
 | `warnings` | Things observed but not gated: console errors, redirects, a tree that changed mid-run |

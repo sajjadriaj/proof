@@ -191,7 +191,7 @@ moment a check needs code it is a test — write the test and reach it with
 | `still has the route pattern` | `/orders/:id` was generated from a route definition. Use `capture`, or a real value. |
 | `uses ${x}, which no check captures` | A typo, or a check ordered before the one that produces the value. |
 | `nothing asserts what the app returned` | The run passed and proves less than it looks. Add `body_contains` or `json`. |
-| `has not agreed with itself` | A check has been flaky. Find the nondeterminism or make the check wait — `retry_for_ms`. |
+| `has not agreed with itself` | A check has been flaky on the same code. Find the nondeterminism or make the check wait — `retry_for_ms`. |
 
 ## What not to do
 
