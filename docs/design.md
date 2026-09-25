@@ -43,10 +43,19 @@ assertion is edited, so proof compares what each run *asserted*, not just the na
 check and its next failure reads `Not comparable: this check asserted something else in run
 0001` rather than blaming code that never moved.
 
-The baseline is also the previous run *of the same contract*. Every contract's runs share one
-`.proof/runs` directory, so without that restriction "passed in run 0001" could be a claim
-about a different contract that happens to name a check the same way. With no comparable run,
-proof says nothing rather than something wrong.
+The baseline is also the previous run *of the same contract*, **on this commit's lineage**.
+Every contract's runs share one `.proof/runs` directory and so does every branch, so without
+those restrictions "passed in run 0001" could be a claim about a different contract that names
+a check the same way — or about another branch, where the feature exists and here it never has.
+Switching branches and running the contract used to report the other branch's work as a
+regression on this one.
+
+Comparable means the baseline's commit is in this commit's history: that is what "it used to
+work" asserts. The run at *this* commit wins when there is one, which is the ordinary
+edit-and-rerun loop; otherwise the search widens to the lineage, so a branch run becomes
+comparable again the moment it is merged. Outside a repository there are no branches to
+confuse and the previous run is the baseline as before. With no comparable run, proof says
+nothing rather than something wrong.
 
 The same lines appear in `report.md`, and `--json` carries `was` and `since` on every failure
 entry. It never changes the verdict or the exit code.

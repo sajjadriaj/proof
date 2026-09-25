@@ -50,6 +50,9 @@ criteria:
   - id: AC10
     requirement: a search that finds nothing reports what it tried and never reports correctness
     source: the attack design note, sections 19 and 28
+  - id: AC11
+    requirement: evidence from another branch is never read as this branch's history
+    source: switching branches and running proof
 
 checks:
   - name: unit tests
@@ -538,6 +541,31 @@ checks:
       test $rc -eq 0 && printf '%s' "$out" | grep -q 'NO COUNTEREXAMPLE FOUND' &&
       printf '%s' "$out" | grep -q 'does not establish correctness' &&
       printf '%s' "$out" | grep -q 'candidates evaluated'
+    expect_exit: 0
+
+  # Branches share one `.proof/runs` directory, so the run before this one is not always a run
+  # about this code. The field that suffers most is the one an agent acts on hardest: a
+  # regression means "you broke this", and across a branch switch it was somebody else's work.
+  - name: a run from another branch is not read as this branch's history
+    satisfies: [AC11]
+    run: >-
+      d=$(mktemp -d) && cd "$d" && git init -q -b main . &&
+      git config user.email t@t.t && git config user.name t && mkdir -p .proof &&
+      printf 'old\n' > app.txt &&
+      printf 'goal: g\nchecks:\n  - name: the feature is there\n    file: {path: app.txt, contains: "the feature"}\n' > .proof/spec.yaml &&
+      git add -A && git commit -qm base > /dev/null &&
+      git checkout -q -b feature && printf 'the feature\n' > app.txt &&
+      git commit -qam feature > /dev/null &&
+      node "$OLDPWD/bin/proof.js" check > /dev/null 2>&1; passed=$?;
+      git checkout -q main &&
+      out=$(node "$OLDPWD/bin/proof.js" check 2>&1); failed=$?;
+      printf 'broken\n' > app.txt && git commit -qam break > /dev/null &&
+      git checkout -q feature && printf 'gone\n' > app.txt &&
+      same=$(node "$OLDPWD/bin/proof.js" check 2>&1);
+      cd /; rm -rf "$d";
+      test $passed -eq 0 && test $failed -eq 1 &&
+      ! printf '%s' "$out" | grep -q 'Regression' &&
+      printf '%s' "$same" | grep -q 'Regression'
     expect_exit: 0
 
 # Faults this contract has to catch. Each one is injected into a throwaway copy of the

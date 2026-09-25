@@ -782,7 +782,7 @@ Everything `proof check --json` recorded for that run, read back from `result.js
 
 | Field | Meaning |
 | --- | --- |
-| `runs` | `{id, dir, at, goal, spec, checks, failed, stale, bytes, status}` per run, oldest first |
+| `runs` | `{id, dir, at, goal, spec, branch, checks, failed, stale, bytes, status}` per run, oldest first. `branch` is the branch the run was recorded on — branches share one runs directory, and the listing shows the column once more than one appears |
 | `shown` | How many runs are in `runs`; `--all` shows every one |
 | `total_runs` | How many runs exist, whether shown or not |
 | `bytes` | Total size of `.proof/runs` on disk |

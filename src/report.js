@@ -392,7 +392,7 @@ export function listRunsDetailed({ limit = Infinity } = {}) {
   // is not, so only do it for what is shown.
   return ids.slice(Math.max(0, ids.length - limit)).map(id => {
     const dir = join(RUNS(), id)
-    const base = { id, dir, at: null, goal: null, spec: null, checks: 0, failed: 0, stale: false, bytes: dirSize(dir) }
+    const base = { id, dir, at: null, goal: null, spec: null, branch: null, checks: 0, failed: 0, stale: false, bytes: dirSize(dir) }
 
     // A run killed mid-flight leaves a directory and no verdict. Hiding it left a gap in
     // the sequence that proof could explain and did not.
@@ -408,6 +408,9 @@ export function listRunsDetailed({ limit = Infinity } = {}) {
         at: r.at,
         goal: r.goal,
         spec: r.spec ?? null,
+        // Branches share one runs directory, and a list that does not say which branch a run
+        // came from is a list nobody can read after switching once.
+        branch: r.git?.branch ?? null,
         checks: r.results.length,
         failed,
         stale: isStale(r),
@@ -449,6 +452,13 @@ function printRunList(json, all) {
   const ambiguous = new Set([...contracts].map(short)).size < contracts.size
   const label = spec => (ambiguous ? String(spec ?? '') : short(spec))
 
+  // Same rule as the contract label: only when there is something to tell apart. On a
+  // single-branch repository this column is noise; the moment you switch branches it is the
+  // only thing that explains why half the runs are stale and failing.
+  const branches = new Set(runs.map(r => r.branch).filter(Boolean))
+  const showBranch = branches.size > 1
+  const branchWidth = Math.min(20, runs.reduce((max, r) => Math.max(max, (r.branch ?? '—').length), 0))
+
   for (const r of runs) {
     const when = r.at ? r.at.replace('T', ' ').slice(0, 16) : '—'.padEnd(16)
     const tally = r.status === 'incomplete' || r.status === 'unreadable' ? '—' : `${r.checks - r.failed}/${r.checks}`
@@ -458,7 +468,8 @@ function printRunList(json, all) {
     // the note is last, so only its own row overflows — but that row is still the one
     // carrying the goal, and a descriptive goal is easily twice the terminal width
     const which = showContract ? `[${label(r.spec) || '?'}] ` : ''
-    const prefix = `  ${r.id.padStart(idWidth)}  ${(VERDICT_TAG[r.status] ?? '????').padEnd(5)}${when}  ${tally.padEnd(7)}${which}`
+    const where = showBranch ? `${truncateToWidth(r.branch ?? '—', branchWidth).padEnd(branchWidth + 2)}` : ''
+    const prefix = `  ${r.id.padStart(idWidth)}  ${(VERDICT_TAG[r.status] ?? '????').padEnd(5)}${when}  ${tally.padEnd(7)}${where}${which}`
     console.log(prefix + truncateToWidth(note, Math.max(20, TERMINAL_WIDTH - prefix.length)))
   }
   // Evidence accumulates quietly — a browser check writes a full-page screenshot every

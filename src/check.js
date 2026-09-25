@@ -7,7 +7,7 @@ import { coverage, criteriaList, fillUncoveredNotice, satisfied, uncovered } fro
 import { fillModifiedNotice, integrity } from './seal.js'
 import { placeholderChecks, serveList, serveLabel, serveCheckName, serveBase } from './validate.js'
 import { evidenceGrowth, RUNS, recentResults, FLAKE_WINDOW, flakiness, fillFlakyNotice } from './runs.js'
-import { context as gitContext, fingerprint, inRepo } from './git.js'
+import { context as gitContext, fingerprint, head, inRepo, isAncestor } from './git.js'
 import { testsChanged, fillTestsNotice } from './diff.js'
 import { runBrowser, slug } from './browser.js'
 import { jsonMismatch } from './json-match.js'
@@ -1279,7 +1279,28 @@ async function runCheck({ json = false, specPath, only, criterion, baseUrl: base
   // Read before this run is recorded, so the baseline is the run before it — and the window
   // behind that is what says whether a check has been disagreeing with itself all along.
   const history = recentResults(specPath ?? SPEC_PATH, FLAKE_WINDOW)
-  const before = history[0] ?? null
+  // The most recent run on THIS commit's lineage, which is not always the most recent run.
+  //
+  // `.proof/runs` is one directory for the whole repository, and branches share it. A run
+  // recorded on another branch describes a state this commit never had, so "passed in run 12,
+  // fails now" from there is a sentence about somebody else's work — and it is the sentence an
+  // agent acts on hardest, because it means "you broke this". Switch branches, run the
+  // contract, and the feature that only ever existed on the other branch was reported as a
+  // regression on this one.
+  //
+  // Outside a repository there are no branches to confuse, so the most recent run is the
+  // baseline as before. A run that predates git context is skipped rather than guessed at.
+  //
+  // Two tiers, because "most recent run that is an ancestor" is not the same as "the run this
+  // one follows". A branch shares its base commit with every other branch, so a run recorded
+  // there is an ancestor of all of them and would outrank this branch's own run purely by
+  // having happened later. The run at THIS commit — the ordinary edit-and-rerun loop — comes
+  // first; only when there is none does the search widen to the lineage.
+  const now = head()
+  const onLineage = inRepo() && now
+    ? (history.find(h => h.result?.git?.head === now) ?? history.find(h => isAncestor(h.result?.git?.head)))
+    : history[0]
+  const before = onLineage ?? null
   const previousRun = before?.id ?? null
   // Keyed with what each check asserted, not just its status. A check edited between runs
   // keeps its name, and "passed in run 0001, fails now" then reads as a regression in the

@@ -54,6 +54,28 @@ export const SHALLOW = base =>
   + " as this branch's work. Fetch the full history (`fetch-depth: 0`, or `git fetch"
   + ' --unshallow`) for a blast radius that means anything.'
 
+/**
+ * Whether `commit` is in HEAD's history — the question "did this used to work?" actually asks.
+ *
+ * A regression is a claim about a lineage: something that passed at a commit this one descends
+ * from, and fails now. A run recorded on another branch describes a state this commit never
+ * had, so "passed in run 12, fails now" there is a sentence about somebody else's work. Cheap
+ * enough to ask per candidate run — `merge-base --is-ancestor` is two object reads.
+ *
+ * A commit that is not in this repository (a rebased branch, a fetched-then-pruned one) is not
+ * an ancestor, which is the conservative answer: no regression claim rather than a wrong one.
+ */
+export const isAncestor = commit => {
+  if (!commit) return false
+  const head = git('rev-parse', 'HEAD')
+  if (!head) return false
+  if (commit === head) return true
+  try {
+    execFileSync('git', ['merge-base', '--is-ancestor', commit, 'HEAD'], { stdio: 'ignore' })
+    return true
+  } catch { return false }
+}
+
 export const noCommonHistory = (base = 'HEAD') =>
   base !== 'HEAD' && git('merge-base', base, 'HEAD') === null
 

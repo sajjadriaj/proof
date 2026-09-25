@@ -2,9 +2,9 @@
   "version": 1,
   "sealed": {
     ".proof/spec.yaml": {
-      "contract_hash": "9e25a625fcfb33e0b0b22baaa10a61a449b8841add5b92ac9fbbf4f27729280a",
-      "sealed_at": "2026-09-18T04:49:17.471Z",
-      "commit": "927786266689ef57d53bf67e0472aae6d3e0338a",
+      "contract_hash": "274edaa678c64aa1b999bfe316b74c389a9c73192a8565177c7d81bf65def7b2",
+      "sealed_at": "2026-09-25T17:59:03.632Z",
+      "commit": "fd712cd5fa6c07875e939c6f9b55b3e168e66784",
       "goal": "proof reports a verdict an agent can act on: 0 when the contract passed, 1 when it failed, 2 when the contract itself is wrong, never DONE for something it did not verify, and never DONE on evidence that is not about this contract and this code",
       "criteria": [
         "AC1",
@@ -16,7 +16,8 @@
         "AC7",
         "AC8",
         "AC9",
-        "AC10"
+        "AC10",
+        "AC11"
       ],
       "criteria_hashes": {
         "AC1": "29ff3e5a30658870e26848939e37710964e7de73914654adfe97f67e446adf87",
@@ -28,7 +29,8 @@
         "AC7": "864c595d37e6d79722e502d83babf14c6d11331b39680c40a83bb601bb85944e",
         "AC8": "a4d0251f39e33ac0e49d290b6b09f6f68d793a0d88955f3f67cef487b530d37c",
         "AC9": "20c4e4b75bca77f42c4159e8865459bc59ca279a6bdc947ba2342877db2d9829",
-        "AC10": "5c7f6d6020cb009100e2a8cbd6a10bc661b869d7e56ea73bad3534f318748374"
+        "AC10": "5c7f6d6020cb009100e2a8cbd6a10bc661b869d7e56ea73bad3534f318748374",
+        "AC11": "656249fada6d4ffc7b9e096c7035b18c954c95d4d56825ee526467bf0ceaee00"
       },
       "checks": {
         "unit tests": "60a6347e2e2770c650dfcddec21cc56d7ba18ccc5d670757c6c3b3815f79e629",
@@ -72,7 +74,8 @@
         "done gates on the recorded chain, not on a claim": "22b161bfcd397af33d07edabfc06dc5aeffb5f2fc226660652600cc824a24553",
         "evidence recorded under another contract is refused, not reused": "5fc6d0f420a20f5a9153dbe25652ef2d8ad6aa25e8bf8177abc12e79c7b44f25",
         "a scenario the contract accepts and the claim forbids is a verification gap": "45e8ca4bc9df6c89c16eadd3eeda97c5e92f89ebd346880a642dbe170d4639f3",
-        "a search that finds nothing refuses to report correctness": "6a671f35876912f8d295f2019f20701ec1e83fcb29cd106f25d97694eb26225c"
+        "a search that finds nothing refuses to report correctness": "6a671f35876912f8d295f2019f20701ec1e83fcb29cd106f25d97694eb26225c",
+        "a run from another branch is not read as this branch's history": "61f6e1fe2a82770d7712f526b2c7b4953b0b37d60b45d5d011cc635e70ac79bf"
       },
       "challenge_hashes": {
         "stop refusing an unfinished contract": "2a2626b142485604f58c7798c5cc787136c81400f4e6e883095c0d19042e2583",
