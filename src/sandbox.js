@@ -84,8 +84,12 @@ export function withWorktree(commit, root, fn) {
  * cwd, its environment and its signal handlers with the run that started it, and the whole
  * point is that this one is somewhere else.
  */
-export function runContract(cwd, absoluteSpec, { label } = {}) {
-  const r = spawnSync(process.execPath, [CLI, 'check', '--json', '--spec', absoluteSpec], {
+export function runContract(cwd, absoluteSpec, { label, criteria } = {}) {
+  // `--criterion` narrows the run to the evidence for one requirement. `challenge` uses it to
+  // ask the sharper and much cheaper question — does the criterion's own evidence catch this
+  // fault? — and falls back to the whole contract before it will call anything missed.
+  const narrow = criteria?.length ? ['--criterion', criteria.join(',')] : []
+  const r = spawnSync(process.execPath, [CLI, 'check', '--json', '--spec', absoluteSpec, ...narrow], {
     cwd,
     encoding: 'utf8',
     maxBuffer: VERDICT_BUFFER,

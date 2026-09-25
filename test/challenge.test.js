@@ -278,3 +278,58 @@ test('an ignored file is not in the copy, and the run says so', () => {
   assert.equal(r.code, 0, r.out)
   assert.match(flat(r.out), /anything your .gitignore excludes is not in it/)
 })
+
+test('a fault that names what it breaks is judged against that criterion first', () => {
+  // The expensive check here is the one that carries no criterion at all. Scoping means it
+  // does not run for a fault that names AC1 — and the fault is still detected.
+  const dir = repo(`goal: g
+criteria:
+  - id: AC1
+    requirement: a token cannot be reused
+checks:
+  - name: the slow suite
+    run: sleep 5
+  - name: the token is single use
+    satisfies: [AC1]
+    file: {path: app.txt, contains: "single-use"}
+challenges:
+  - name: allow token reuse
+    breaks: [AC1]
+    apply: "printf 'token: reusable\\n' > app.txt"
+`)
+
+  const started = Date.now()
+  const r = proof(dir, 'challenge')
+  const seconds = (Date.now() - started) / 1000
+
+  assert.equal(r.code, 0, r.out)
+  assert.match(r.out, /allow token reuse\s+DETECTED/)
+  assert.match(flat(r.out), /judged against the checks that carry the criterion they break/)
+  // The control run pays for `sleep 5` once; the fault must not pay for it again.
+  assert.ok(seconds < 11, `scoped run took ${seconds}s — the slow check ran for the fault too`)
+})
+
+test('a fault the criterion misses is re-run against the whole contract before it is called missed', () => {
+  // `an unrelated guard` carries no criterion, so a scoped run would report MISSED for a fault
+  // the contract does catch. That would be a weakness this contract does not have.
+  const dir = repo(`goal: g
+criteria:
+  - id: AC1
+    requirement: a token cannot be reused
+checks:
+  - name: the token is single use
+    satisfies: [AC1]
+    file: app.txt
+  - name: an unrelated guard
+    file: {path: app.txt, contains: "single-use"}
+challenges:
+  - name: rewrite the token line
+    breaks: [AC1]
+    apply: "printf 'token: reusable\\n' > app.txt"
+`)
+
+  const r = proof(dir, 'challenge')
+  assert.equal(r.code, 0, r.out)
+  assert.match(r.out, /rewrite the token line\s+DETECTED\s+an unrelated guard/)
+  assert.match(flat(r.out), /the fault was noticed, but not as that requirement failing/)
+})

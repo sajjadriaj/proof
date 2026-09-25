@@ -117,10 +117,23 @@ criteria:
       permissions: {network: same-origin}
 ```
 
+Where the contract already describes the operation, `from` borrows it instead of restating it —
+the same request written twice in one file is two things free to drift:
+
+```yaml
+      setup:
+        - {name: issue, from: a token is issued}
+      actions:
+        - {name: redeem, from: redeeming a fresh token works}
+```
+
+The `name` stays, because an invariant counts by it (`successful_redeem`).
+
 | Key | Means |
 | --- | --- |
 | `setup` | Steps run before every scenario, so one candidate does not inherit the last one's state. They must succeed |
 | `actions` | The operations an attack composes: `{name, http}` or `{name, run}`, with an optional `capture`. No `expect` — an attack observes, it does not assert |
+| `from` | On a step, in place of a verb: borrow the operation from a check already in this contract by name. The method, path, body and capture come across; the `expect` does not |
 | `invariants` | What must remain true: one comparison, `<term> <op> <whole number>` |
 | `surfaces` | `input`, `sequence`, `concurrency`. Naming one proof cannot drive is refused rather than ignored |
 | `budget` | `duration` (seconds), `candidates`, `concurrency`. `--budget 5m` overrides the duration |

@@ -36,7 +36,7 @@ test('the regression: an unknown flag stops the run instead of being ignored', a
 test('the error lists what the command does accept', async () => {
   const dir = sandbox()
   const { stderr } = await runCli(dir, ['check', '--dry-run'])
-  assert.match(stderr, /`proof check` accepts: --json, --only, --spec/)
+  assert.match(stderr, /`proof check` accepts: --json, --only, --criterion, --spec/)
 })
 
 test('a near-miss flag gets a suggestion', async () => {

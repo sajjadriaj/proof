@@ -213,7 +213,24 @@ const runOne = (c, { state, root, prefix, absoluteSpec, spec }) => withWorktree(
     }
   }
 
-  return judge(runContract(cwd, absoluteSpec, { label: `the fault "${c.name}"` }), spec)
+  // Two passes, cheapest first.
+  //
+  // A fault that names what it breaks can be judged against the evidence for that criterion
+  // alone — which is the sharper question (does AC5's own evidence catch this?) and, on a
+  // contract whose first check is the whole test suite, the difference between seconds and
+  // minutes. But a fault the criterion's checks do not catch may still be caught by a check
+  // elsewhere, and reporting that as MISSED would be a weakness this contract does not have.
+  // So the full contract runs before anything is called missed, never to confirm a detection.
+  const breaks = breaksOf(c)
+  if (breaks.length) {
+    const scoped = judge(runContract(cwd, absoluteSpec, { label: `the fault "${c.name}"`, criteria: breaks }), spec)
+    if (scoped.status === 'detected') return { ...scoped, scope: breaks }
+  }
+
+  const full = judge(runContract(cwd, absoluteSpec, { label: `the fault "${c.name}"` }), spec)
+  return breaks.length && full.status === 'detected'
+    ? { ...full, scope: null, outside: breaks }
+    : full
 })
 
 export function challenge({ json = false, specPath, from } = {}) {
@@ -352,6 +369,12 @@ function printHuman(o) {
     notes.push(`${r.name} breaks ${r.breaks.join(', ')}, and the checks that caught it`
       + ` (${r.detected_by.join(', ')}) carry ${r.criteria_detected.length ? r.criteria_detected.join(', ') : 'no criterion'}`
       + ' — the fault was noticed, but not as that requirement failing.')
+  }
+  const scoped = o.results.filter(r => r.scope?.length).length
+  if (scoped) {
+    notes.push(`${scoped} fault(s) were judged against the checks that carry the criterion they break,`
+      + ' rather than the whole contract. A fault those checks do not catch is re-run against'
+      + ' everything before it is called missed.')
   }
   notes.push('the copy holds your tracked files and the untracked ones git can see; anything your'
     + ' .gitignore excludes is not in it. A fault aimed at an ignored file would apply to nothing.')

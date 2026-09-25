@@ -51,6 +51,7 @@ const USAGE = `proof — verification CLI for AI coding agents
   --prune       delete all but the most recent runs (report)
   --keep <n>    with --prune, how many runs to keep (report; default 20)
   --only TEXT   run only checks whose name contains TEXT (check)
+  --criterion ID  run only the checks that carry criterion ID, comma-separated (check)
   --base-url U  verify an app already running at U instead of starting one (check)
   --junit       render a run as JUnit XML for CI (report)
   --install     add the Stop hook to .claude/settings.json (hook)
@@ -180,7 +181,13 @@ try {
       process.exitCode = changed({ json, depth: positiveInt(flags.depth, 'depth', 1), base: flags.base ?? 'HEAD', specPath: flags.spec })
       break
     case 'check':
-      process.exitCode = await check({ json, only: flags.only, specPath: flags.spec, baseUrl: flags['base-url'] })
+      process.exitCode = await check({
+        json,
+        only: flags.only,
+        criterion: flags.criterion,
+        specPath: flags.spec,
+        baseUrl: flags['base-url'],
+      })
       break
     case 'guard':
       process.exitCode = await guard({

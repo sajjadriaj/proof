@@ -85,7 +85,7 @@ export const ALLOWED = {
   'criterion.attack': ['surfaces', 'budget', 'permissions', 'setup', 'actions', 'invariants'],
   'criterion.attack.budget': ['duration', 'candidates', 'concurrency'],
   'criterion.attack.permissions': ['network', 'environment_mutation'],
-  action: ['name', 'http', 'run', 'capture', 'timeout'],
+  action: ['name', 'from', 'http', 'run', 'capture', 'timeout'],
   'criterion.source': ['type', 'reference'],
   policy: ['require_criteria_coverage', 'require_criteria_falsification', 'require_falsification',
     'require_sealed_contract', 'require_challenges', 'allow_flakes', 'allow_skipped'],
@@ -720,7 +720,7 @@ export function validateCriteria(spec, problems) {
     if (isPlain(c.source) && c.source.reference === undefined) {
       problems.push(`${at} › source: needs a \`reference\` — the issue, ticket or document it came from`)
     }
-    validateAttack(c.attack, `${at} › attack`, problems)
+    validateAttack(c.attack, `${at} › attack`, problems, spec)
   })
 
 }
@@ -754,7 +754,7 @@ const UNIMPLEMENTED_SURFACES = {
  * stating out loud is that actions carry no `expect` — an attack has no expectations, only
  * observations, and the assertion lives in the invariant where both oracles can read it.
  */
-function validateAttack(attack, at, problems) {
+function validateAttack(attack, at, problems, spec = {}) {
   if (attack === undefined) return
   if (!isPlain(attack)) return problems.push(`${at}: must be a mapping — \`{actions, invariants}\` at least`)
   walk(attack, 'criterion.attack', at, problems)
@@ -785,10 +785,31 @@ function validateAttack(attack, at, problems) {
           + ' of `successful_' + step.name + '` would be about two different operations')
       } else names.set(step.name, where)
 
+      // `from` is the same operation the contract already describes, borrowed rather than
+      // retyped. The check it names carries the method, the path, the body and the capture; an
+      // attack takes all of that and drops the `expect`, because an attack observes.
       const verbs = ['http', 'run'].filter(v => v in step)
-      if (verbs.length !== 1) {
-        problems.push(`${where}: needs exactly one of \`http\` or \`run\` — an attack composes requests`
-          + ' and commands, and those are the two it can observe')
+      if (step.from !== undefined) {
+        if (verbs.length) {
+          problems.push(`${where}: \`from\` and \`${verbs[0]}\` are alternatives — \`from\` borrows the`
+            + ' operation from a check you already wrote. Keep whichever this step means.')
+        }
+        if (typeof step.from !== 'string' || !step.from.trim()) {
+          problems.push(`${where} › from: must name a check in this contract`)
+        } else {
+          const source = (Array.isArray(spec.checks) ? spec.checks : []).find(c => c?.name === step.from)
+          if (!source) {
+            const names = (Array.isArray(spec.checks) ? spec.checks : []).map(c => c?.name).filter(Boolean)
+            const hint = suggest(step.from, names)
+            problems.push(`${where} › from: no check named "${step.from}"${hint ? ` — did you mean "${hint}"?` : ''}`)
+          } else if (!['http', 'run'].some(v => v in source)) {
+            problems.push(`${where} › from: "${step.from}" is a \`${VERBS.find(v => v in source) ?? 'verbless'}\` check,`
+              + ' and an attack composes requests and commands — those are the two it can observe')
+          }
+        }
+      } else if (verbs.length !== 1) {
+        problems.push(`${where}: needs exactly one of \`http\`, \`run\` or \`from\` — an attack composes`
+          + ' requests and commands, and those are the two it can observe')
       }
       if (isPlain(step.http)) {
         if (!step.http.path && !step.http.url) problems.push(`${where} › http: needs a \`path\` or \`url\``)

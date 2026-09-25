@@ -3,7 +3,7 @@ import { constants } from 'node:os'
 import { mkdirSync, writeFileSync, existsSync, readFileSync, readdirSync, statSync, openSync, readSync, closeSync } from 'node:fs'
 import { join } from 'node:path'
 import { loadSpec, PROOF_DIR, SPEC_PATH, writeFileAtomic, writeError, contractChange, CONTRACT_CHANGED_NOTICE } from './spec.js'
-import { coverage, fillUncoveredNotice, satisfied, uncovered } from './criteria.js'
+import { coverage, criteriaList, fillUncoveredNotice, satisfied, uncovered } from './criteria.js'
 import { fillModifiedNotice, integrity } from './seal.js'
 import { placeholderChecks, serveList, serveLabel, serveCheckName, serveBase } from './validate.js'
 import { evidenceGrowth, RUNS, recentResults, FLAKE_WINDOW, flakiness, fillFlakyNotice } from './runs.js'
@@ -1198,7 +1198,7 @@ async function runOne({ check: c, index }, ctx, vars, producedBy) {
   }
 }
 
-export async function check({ json = false, specPath, only, baseUrl: baseUrlOverride } = {}) {
+export async function check({ json = false, specPath, only, criterion, baseUrl: baseUrlOverride } = {}) {
   // One run per project at a time — but only for a contract that starts something.
   //
   // Concurrent runs are a deliberate feature and each gets its own evidence directory (see
@@ -1214,13 +1214,13 @@ export async function check({ json = false, specPath, only, baseUrl: baseUrlOver
     ? acquire({ spec: specPath ?? SPEC_PATH, command: 'check' })
     : () => {}
   try {
-    return await runCheck({ json, specPath, only, baseUrl: baseUrlOverride })
+    return await runCheck({ json, specPath, only, criterion, baseUrl: baseUrlOverride })
   } finally {
     release()
   }
 }
 
-async function runCheck({ json = false, specPath, only, baseUrl: baseUrlOverride } = {}) {
+async function runCheck({ json = false, specPath, only, criterion, baseUrl: baseUrlOverride } = {}) {
   const spec = loadSpec(specPath)
 
   // A contract still holding one of proof's own placeholders is unfinished, and an
@@ -1236,11 +1236,43 @@ async function runCheck({ json = false, specPath, only, baseUrl: baseUrlOverride
 
   // A subset run is for iterating on one failure fast. It can never say "done" —
   // completion is a claim about the whole contract, including regressions.
+  //
+  // `--criterion` selects the same way `--only` does, by what the checks say about themselves
+  // rather than by their names: the evidence for one requirement, which is what an agent
+  // iterating on one acceptance criterion wants, and what `challenge` needs to ask whether a
+  // fault is caught by the checks that carry the criterion it breaks.
+  if (only && criterion) {
+    throw Object.assign(
+      new Error('--only and --criterion are alternatives — one selects by name, the other by the'
+        + ' criterion a check declares it satisfies. Keep whichever this run means.'),
+      { code: 'EUSAGE' })
+  }
+
+  const wanted = criterion ? String(criterion).split(',').map(id => id.trim()).filter(Boolean) : []
+  if (wanted.length) {
+    const declared = new Set(criteriaList(spec).map(c => String(c.id)))
+    const unknown = wanted.filter(id => !declared.has(id))
+    if (unknown.length) {
+      throw Object.assign(
+        new Error(`no criterion ${unknown.map(id => `"${id}"`).join(', ')} in ${specPath ?? SPEC_PATH}`
+          + ` — have: ${[...declared].join(', ') || 'none declared'}`),
+        { code: 'ENOCRITERION' })
+    }
+  }
+
   const selected = only
     ? spec.checks.filter(c => String(c.name ?? '').toLowerCase().includes(only.toLowerCase()))
-    : spec.checks
+    : wanted.length
+      ? spec.checks.filter(c => satisfied(c).some(id => wanted.includes(id)))
+      : spec.checks
   if (only && !selected.length) {
     throw Object.assign(new Error(`no check matches "${only}" — have: ${spec.checks.map(c => c.name ?? '(unnamed)').join(', ')}`), { code: 'ENOMATCH' })
+  }
+  if (wanted.length && !selected.length) {
+    throw Object.assign(
+      new Error(`no check declares \`satisfies: [${wanted.join(', ')}]\`, so there is no evidence to run`
+        + ' for it — that is the gap `proof check` reports as an uncovered criterion'),
+      { code: 'ENOMATCH' })
   }
   const partial = selected.length !== spec.checks.length
 
@@ -1298,7 +1330,8 @@ async function runCheck({ json = false, specPath, only, baseUrl: baseUrlOverride
   // server when nothing selected needs it — `--only "unit tests"` booted the dev server
   // anyway, and a server that would not start failed the run before the selected check ever
   // ran, blocking someone iterating on one unit test for an unrelated reason.
-  const needsApp = !against && (!only || selected.some(c => 'http' in c || 'browser' in c))
+  const narrowed = Boolean(only) || wanted.length > 0
+  const needsApp = !against && (!narrowed || selected.some(c => 'http' in c || 'browser' in c))
 
   try {
     if (serves.length && needsApp) {
@@ -1451,6 +1484,8 @@ async function runCheck({ json = false, specPath, only, baseUrl: baseUrlOverride
     git,
     partial,
     only: only ?? null,
+    // Which criterion's evidence this run selected, when that is how it was narrowed.
+    criterion: wanted.length ? wanted : null,
     // Said out loud: the absence of `app boots` from a subset run is a decision, not a gap.
     serve_skipped: serveSkipped,
     // Checks switched off in the contract, each with the reason written beside it.
@@ -1620,7 +1655,8 @@ function printHuman(r) {
   }
   if (r.partial) {
     const skipped = r.serve_skipped ? ' The serve block was not started: nothing selected needs it.' : ''
-    console.log(`\nSubset run: --only "${r.only}" selected ${r.selected_checks} of ${r.contract_checks} check(s).${skipped}`)
+    const how = r.criterion ? `--criterion ${r.criterion.join(',')}` : `--only "${r.only}"`
+    console.log(`\nSubset run: ${how} selected ${r.selected_checks} of ${r.contract_checks} check(s).${skipped}`)
   }
   // The requirement, check by check. Passing checks are evidence for what the checks assert;
   // this is the column that says whether that adds up to what was asked for.

@@ -294,3 +294,51 @@ test('a baseline that is no longer in the repository is INVALID, not a pass', ()
   assert.match(r.out, /VERDICT\n {2}INVALID/)
   assert.match(flat(r.out), /is no longer in this repository/)
 })
+
+// --- the one step to take now ------------------------------------------------------------
+
+test('the gate names the next command, in lifecycle order', async () => {
+  const { nextStep } = await import('../src/done.js')
+
+  const base = {
+    criteria: [],
+    contract: { modified: false },
+    invalid: [],
+    checks: { total: 2, passed: 2 },
+    falsification: { result: 'discriminates' },
+    challenges: { missed: [], counterexamples: [], result: 'complete' },
+    attack: { gaps: [], violations: [], counterexamples: [], result: 'no_counterexample_found' },
+    flakes: [],
+    policy: {},
+  }
+
+  assert.equal(nextStep({ ...base, checks: { total: null, passed: null } }).run, 'proof check')
+  assert.equal(nextStep({ ...base, checks: { total: 2, passed: 1 } }).run, 'proof report')
+  assert.equal(nextStep({ ...base, falsification: { result: 'missing' } }).run, 'proof falsify')
+  assert.equal(nextStep({ ...base, contract: { modified: true } }).run, 'proof diff')
+  assert.equal(nextStep({ ...base, invalid: ['evidence is about other code'] }).run, 'proof check')
+
+  // A finding names its own counterexample rather than a placeholder.
+  const gap = nextStep({
+    ...base,
+    attack: { gaps: ['AC1'], violations: [], counterexamples: ['.proof/counterexamples/ce-17f09e06.yaml'], result: 'verification_gap' },
+  })
+  assert.equal(gap.run, 'proof replay ce-17f09e06')
+
+  // A criterion with no evidence has no command to run — it needs a check written.
+  const uncovered = nextStep({ ...base, criteria: [{ id: 'AC4', status: 'uncovered' }] })
+  assert.equal(uncovered.run, null)
+  assert.match(uncovered.why, /satisfies: \[AC4\]/)
+
+  // Everything satisfied: nothing to suggest.
+  assert.equal(nextStep(base), null)
+})
+
+test('the next step is carried in --json too, so an agent reads the same answer', () => {
+  const dir = repo(`${CONTRACT}policy:
+  require_falsification: false
+`)
+  const payload = JSON.parse(proof(dir, 'done', '--json').stdout)
+  assert.equal(payload.next.run, 'proof check')
+  assert.match(payload.next.why, /nothing has run this contract yet/)
+})

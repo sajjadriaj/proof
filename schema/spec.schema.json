@@ -110,6 +110,7 @@
                     "name": {
                       "type": "string"
                     },
+                    "from": {},
                     "http": {
                       "type": "object",
                       "additionalProperties": false,
@@ -165,6 +166,7 @@
                     "name": {
                       "type": "string"
                     },
+                    "from": {},
                     "http": {
                       "type": "object",
                       "additionalProperties": false,

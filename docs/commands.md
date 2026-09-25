@@ -609,6 +609,28 @@ The repository also ships a composite action:
 It runs the contract, writes the JUnit file, appends the markdown report to the job summary,
 and exits with the verdict's own code.
 
+### Running one criterion's evidence
+
+`--only TEXT` selects checks by name. `--criterion AC3` selects them by the criterion they
+declare they satisfy — the evidence for one requirement, which is usually what you want while
+iterating on one acceptance criterion:
+
+```console
+$ proof check --criterion AC3
+
+Subset run: --criterion AC3 selected 2 of 14 check(s).
+```
+
+Comma-separated for several (`--criterion AC3,AC4`). Like any subset it reports `INCOMPLETE`,
+never `DONE`. A criterion no check satisfies is refused rather than run as an empty selection —
+that gap is what `proof check` reports as an uncovered criterion.
+
+`proof challenge` uses the same selection internally: a fault that declares `breaks: [AC3]` is
+first judged against AC3's own evidence, which on a contract whose first check is the whole
+test suite is the difference between seconds and minutes. A fault those checks do not catch is
+then re-run against the entire contract before it is ever called `MISSED`, because a fault
+caught by a check elsewhere is not a weakness this contract has.
+
 ### Iterating on one failure
 
 `proof check --only "browser flow"` runs just the checks whose name contains that text —
@@ -701,6 +723,7 @@ string is a parser nobody should have to write against a tool built for agents.
 | `tree` | Fingerprint of the tree at that moment; `proof report` uses it to mark a run stale |
 | `partial` | True when `--only` selected a subset |
 | `only` | The `--only` text, or `null` |
+| `criterion` | The criterion ids `--criterion` selected, or `null`. Both narrow a run, and both make it `partial` |
 | `serve_skipped` | True when a subset selected nothing that needs the app, so the `serve` block was not started |
 | `skipped` | `{check, reason}` for each check switched off with `skip:` in the contract. One of these makes the run `partial` |
 | `criteria` | `{id, requirement, source, checks, status}` per declared acceptance criterion: which checks are evidence for it and what this run says about them. `status` is `verified`, `failed`, `unverified` or `uncovered`. An `uncovered` one makes the run `partial` |
@@ -739,7 +762,9 @@ object is kept in `.proof/attacks.json`. `proof replay --json` carries `countere
 
 `proof done --json` is the manifest written to `.proof/report.json`: `verdict`, `spec`, `goal`,
 `implementation`, `contract`, `criteria`, `coverage`, `checks`, `falsification`, `challenges`,
-`policy` and `reasons`.
+`attack`, `flakes`, `policy` and `reasons` — plus `next`, `{run, why}`, the one command to run
+now. The manifest on disk holds everything but `next`, which is about where you are rather than
+about the run.
 
 `proof report --json` returns the same object plus `stale`, and keeps each result's full
 `output`; `proof check --json` omits it there to stay small, since the complete text is in

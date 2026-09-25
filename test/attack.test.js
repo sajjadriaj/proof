@@ -336,3 +336,77 @@ test('the boundary values are the ones that break parsing, not a random corpus',
     assert.ok(labels.includes(expected), `${expected} is tried`)
   }
 })
+
+test('an action can borrow the operation from a check already in the contract', () => {
+  // The contract already describes issuing and redeeming. Retyping both into the attack block
+  // is the same request written twice in one file, free to drift.
+  const port = nextPort++
+  const dir = mkdtempSync(join(tmpdir(), 'proof-attack-from-'))
+  const g = (...a) => execFileSync('git', a, { cwd: dir, stdio: 'ignore' })
+  mkdirSync(join(dir, '.proof'))
+  writeFileSync(join(dir, 's.mjs'), server(port, { racy: true }))
+  writeFileSync(join(dir, '.proof', 'spec.yaml'), `goal: a reset token can only be redeemed once
+serve:
+  run: node s.mjs
+  ready_url: http://127.0.0.1:${port}/issue
+  timeout: 20
+criteria:
+  - id: AC1
+    requirement: a reset token cannot be redeemed twice
+    attack:
+      surfaces: [concurrency]
+      setup:
+        - {name: issue, from: a token is issued}
+      actions:
+        - {name: redeem, from: redeeming a fresh token works}
+      invariants:
+        - successful_redeem <= 1
+checks:
+  - name: a token is issued
+    http: {method: POST, path: /issue, expect: {status: 200}}
+    capture: {token: json.token}
+  - name: redeeming a fresh token works
+    http: {method: POST, path: /redeem, body: {token: "\${token}"}, expect: {status: 200, json: {ok: true}}}
+  - name: redeeming the same token again is refused
+    satisfies: [AC1]
+    http: {method: POST, path: /redeem, body: {token: "\${token}"}, expect: {status: 401}}
+`)
+  g('init', '-q', '-b', 'main', '.')
+  g('config', 'user.email', 't@t.t')
+  g('config', 'user.name', 't')
+  g('add', '-A')
+  g('commit', '-qm', 'base')
+
+  const r = proof(dir, 'attack')
+  assert.equal(r.code, 1, r.out)
+  assert.match(r.out, /VERIFICATION_GAP/)
+  assert.match(r.out, /successful_redeem was 2/)
+})
+
+test('a from that names nothing is refused, with the nearest check offered', () => {
+  const problems = validateSpec({
+    goal: 'g',
+    serve: { run: 'x', ready_url: 'http://127.0.0.1:1' },
+    criteria: [{
+      id: 'AC1',
+      requirement: 'r',
+      attack: { actions: [{ name: 'redeem', from: 'redeeming a fresh token work' }], invariants: ['successful_redeem <= 1'] },
+    }],
+    checks: [{ name: 'redeeming a fresh token works', satisfies: ['AC1'], http: { path: '/r' } }],
+  })
+  assert.ok(problems.some(p => /no check named "redeeming a fresh token work" — did you mean/.test(p)), problems.join('\n'))
+})
+
+test('from and a verb together are refused — one step, one operation', () => {
+  const problems = validateSpec({
+    goal: 'g',
+    serve: { run: 'x', ready_url: 'http://127.0.0.1:1' },
+    criteria: [{
+      id: 'AC1',
+      requirement: 'r',
+      attack: { actions: [{ name: 'a', from: 'c', http: { path: '/a' } }], invariants: ['successful_a <= 1'] },
+    }],
+    checks: [{ name: 'c', satisfies: ['AC1'], http: { path: '/c' } }],
+  })
+  assert.ok(problems.some(p => /`from` and `http` are alternatives/.test(p)), problems.join('\n'))
+})

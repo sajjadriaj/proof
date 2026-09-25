@@ -8,7 +8,7 @@ export const COMMAND_FLAGS = {
   init: ['force', 'spec'],
   infer: ['write', 'depth', 'base', 'spec'],
   changed: ['depth', 'base', 'spec'],
-  check: ['only', 'spec', 'base-url'],
+  check: ['only', 'criterion', 'spec', 'base-url'],
   seal: ['spec'],
   diff: ['spec'],
   challenge: ['spec', 'from'],
@@ -25,7 +25,7 @@ export const COMMAND_FLAGS = {
 
 /** Flags that consume the next argument. */
 export const VALUE_FLAGS = new Set(['depth', 'base', 'only', 'spec', 'keep', 'max-attempts', 'base-url',
-  'from', 'budget', 'seed', 'strategy'])
+  'from', 'budget', 'seed', 'strategy', 'criterion'])
 
 /** How many bare arguments each command accepts. */
 export const POSITIONALS = {

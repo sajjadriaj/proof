@@ -55,6 +55,47 @@ export const manifestPath = (specPath = SPEC_PATH) => {
 const VERDICT = { done: 'DONE', incomplete: 'INCOMPLETE', invalid: 'INVALID' }
 
 /**
+ * The one command to run next.
+ *
+ * A verdict that lists eight missing things is a verdict somebody reads twice and acts on
+ * once. The lifecycle has an order — a contract, then evidence it discriminates, then a run,
+ * then the searches — and at any moment exactly one step is the one in front of you. Ordered
+ * by that, not by severity: fixing a failing check before the contract is even the one that
+ * was agreed is work done against a moving target.
+ */
+const idOf = (paths = []) => {
+  // One finding names itself; several are a list the reader picks from.
+  const ids = paths.map(p => String(p).split(/[\\/]/).pop().replace(/\.yaml$/, ''))
+  return ids.length === 1 ? ids[0] : '<id>'
+}
+
+export function nextStep(o) {
+  const c = o.criteria ?? []
+  const uncovered = c.filter(r => r.status === 'uncovered').map(r => r.id)
+
+  if (o.contract.modified) return { run: 'proof diff', why: 'the contract moved after it was sealed — see what changed, then `proof seal` to accept it' }
+  if (uncovered.length) return { run: null, why: `write a check for ${uncovered.join(', ')}, or add \`satisfies: [${uncovered[0]}]\` to the one that proves it` }
+  if (o.invalid.length) return { run: 'proof check', why: 'the evidence on record is about other code' }
+  if (o.checks.total === null) return { run: 'proof check', why: 'nothing has run this contract yet' }
+  if ((o.checks.passed ?? 0) < (o.checks.total ?? 0)) return { run: 'proof report', why: 'read the evidence for the checks that failed, then fix and re-run' }
+  if (o.falsification.result === 'missing') return { run: 'proof falsify', why: 'the contract has never been shown to fail without the change' }
+  if (['stale', 'baseline-missing'].includes(o.falsification.result)) return { run: 'proof falsify', why: 'the falsification on record is about a different contract' }
+  if (o.falsification.result === 'does-not-discriminate') return { run: null, why: 'assert what the change produces — a body, a field, a row — so the contract fails without it' }
+  if (o.challenges.missed.length) {
+    return { run: `proof promote ${idOf(o.challenges.counterexamples)}`, why: 'a fault went unnoticed — promote it, then write the assertion that catches it' }
+  }
+  if (o.attack.gaps.length || o.attack.violations.length) {
+    return { run: `proof replay ${idOf(o.attack.counterexamples)}`, why: 'a scenario satisfies the contract and violates the claim — fix it, then replay until it stops reproducing' }
+  }
+  if (o.policy.require_challenges && o.challenges.result === 'missing') return { run: 'proof challenge', why: 'the contract has not been challenged' }
+  if (o.policy.require_attack && o.attack.result === 'missing') return { run: 'proof attack', why: 'nothing has gone looking for a counterexample' }
+  if (['stale', 'outdated'].includes(o.challenges.result)) return { run: 'proof challenge', why: 'the challenge on record is about other code' }
+  if (['stale', 'outdated'].includes(o.attack.result)) return { run: 'proof attack', why: 'the attack on record is about other code' }
+  if (o.flakes.length) return { run: 'proof report --list', why: 'a check does not agree with itself — find the nondeterminism, or make it wait for what it needs' }
+  return null
+}
+
+/**
  * The verification chain, evaluated.
  *
  * Split from the printing and the file writing so it can be tested without a repository, and
@@ -204,6 +245,7 @@ export function evaluate({ spec, specPath = SPEC_PATH, run = null, runId = null,
     detected: challenges?.detected ?? [],
     missed: challenges?.missed ?? [],
     inconclusive: challenges?.inconclusive ?? [],
+    counterexamples: challenges?.counterexamples ?? [],
     result: freshness(challenges) ?? challenges.status,
   }
   if (challenge.missed.length && !['stale', 'outdated'].includes(challenge.result)) {
@@ -296,6 +338,9 @@ export function evaluate({ spec, specPath = SPEC_PATH, run = null, runId = null,
   }
 }
 
+/** Filled after the verdict object exists, so `--json` and the terminal agree on the step. */
+export const withNext = out => ({ ...out, next: nextStep(out) })
+
 export function done({ json = false, specPath } = {}) {
   const path = specPath ?? SPEC_PATH
   const spec = loadSpec(path)
@@ -324,7 +369,7 @@ export function done({ json = false, specPath } = {}) {
       'It is the artifact CI and reviewers read; the verdict above is unaffected.')
   }
 
-  if (json) console.log(JSON.stringify(out, null, 2))
+  if (json) console.log(JSON.stringify(withNext(out), null, 2))
   else printHuman(out, file)
 
   return out.verdict === 'DONE' ? 0 : 1
@@ -394,6 +439,12 @@ function printHuman(o, file) {
 
   if (o.reasons.length) {
     console.log(`\nWHY NOT DONE\n${o.reasons.map(r => block(r, '  ')).join('\n\n')}`)
+  }
+
+  // One step, not eight. The others are still above; this is the one to take now.
+  const next = nextStep(o)
+  if (next) {
+    console.log(`\nNEXT\n${next.run ? `  ${next.run}\n` : ''}${block(next.why, '  ')}`)
   }
 
   console.log(`\nManifest:\n  ${file}`)

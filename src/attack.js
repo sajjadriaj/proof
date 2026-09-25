@@ -21,6 +21,7 @@ import { contractKey, loadSpec, PROOF_DIR, SPEC_PATH, writeError, writeFileAtomi
 import { criteriaList, satisfied } from './criteria.js'
 import { contractHash } from './seal.js'
 import { boot, kill, RUNNERS } from './check.js'
+import { acquire } from './runlock.js'
 import { serveList } from './validate.js'
 import { firstViolation, serverError, expressionOf } from './invariant.js'
 import { save as saveCounterexample, markReplay, read as readCounterexample, pathOf } from './counterexample.js'
@@ -395,11 +396,29 @@ export function classify({ violated, contractPassed, anyContract, errored, suspi
 
 // --- the engine -------------------------------------------------------------------------------
 
-const planFor = criterion => {
-  const actions = criterion.attack.actions ?? []
+/**
+ * A step, with `from:` resolved against the contract.
+ *
+ * The contract already describes this operation — the method, the path, the body, the value it
+ * captures — and an attack that made you retype it would be asking for the same request twice
+ * in one file, with the two free to drift. The `expect` is dropped on the way through: an
+ * attack has no expectations, and the assertion lives in the invariant.
+ */
+export const resolveStep = (step, spec) => {
+  if (!step?.from) return step
+  const source = (spec.checks ?? []).find(c => c?.name === step.from)
+  if (!source) return step
+  const { name, expect_exit: _x, expect_output: _o, results: _r, satisfies: _s, skip: _k, parallel: _p, ...rest } = source
+  const http = rest.http ? { ...rest.http } : undefined
+  if (http) delete http.expect
+  return { ...rest, ...(http ? { http } : {}), name: step.name ?? name, capture: step.capture ?? rest.capture }
+}
+
+const planFor = (criterion, spec) => {
+  const actions = (criterion.attack.actions ?? []).map(a => resolveStep(a, spec))
   return {
     actions,
-    setup: criterion.attack.setup ?? [],
+    setup: (criterion.attack.setup ?? []).map(s => resolveStep(s, spec)),
     byName: new Map(actions.map(a => [a.name, a])),
     invariants: criterion.attack.invariants ?? [],
     surfaces: criterion.attack.surfaces ?? SURFACES,
@@ -466,20 +485,27 @@ const responds = async url => {
  * on the port and report the enclosing run as the squatter. An attack keeps the stricter rule
  * `check` follows: it starts what it observes, so that what it observes is this code.
  */
-async function withApp(spec, fn, { attach = false } = {}) {
+async function withApp(spec, fn, { attach = false, specPath = SPEC_PATH, command = 'attack' } = {}) {
   const serves = serveList(spec)
   const base = serves.map(s => s.ready_url ?? s.url).filter(Boolean).at(-1)
 
+  // Attaching takes no lock, and must not: the run that started the app is holding it. That is
+  // the shape a promoted counterexample has — an ordinary check inside `proof check`, replaying
+  // against the app the enclosing run booted.
   if (attach && base && await responds(base)) {
     return { attached: true, value: await fn({ baseUrl: base, cookies: new Map(), runDir: PROOF_DIR }) }
   }
 
+  // Starting one does. An attack owns the port and the build directory exactly as `check` does,
+  // and two runs in one working tree destroy each other — see src/runlock.js.
+  const release = serves.length ? acquire({ spec: specPath, command }) : () => {}
   const started = []
   try {
     for (const serve of serves) started.push(await boot(serve))
     return { attached: false, value: await fn({ baseUrl: base, cookies: new Map(), runDir: PROOF_DIR }) }
   } finally {
     for (const server of [...started].reverse()) kill(server.proc)
+    release()
   }
 }
 
@@ -551,9 +577,9 @@ export async function attack({ json = false, criterion: only, budget: durationOv
   const findings = []
   const summaries = []
 
-  const { value: _attacked } = await withApp(spec, async ctx => {
+  const { value: _searched } = await withApp(spec, async ctx => {
     for (const criterion of chosen) {
-      const plan = planFor(criterion)
+      const plan = planFor(criterion, spec)
       const budget = budgetOf(criterion, durationOverride === undefined ? undefined : { duration: durationOverride })
       const random = rng(usedSeed)
       const candidates = from
@@ -658,7 +684,7 @@ export async function attack({ json = false, criterion: only, budget: durationOv
         findings.push(outcome)
       }
     }
-  })
+  }, { specPath: path, command: 'attack' })
 
   const out = {
     status: summaries.some(s => s.result === RESULT.gap) ? 'verification_gap'
@@ -777,9 +803,12 @@ export async function replay({ id, json = false, specPath } = {}) {
       { code: 'ENOCRITERION' })
   }
 
-  const plan = planFor(criterion)
+  const plan = planFor(criterion, spec)
   const invariants = example.invariant ? [example.invariant.replace(/\s+/g, ' ')] : plan.invariants
-  const { attached, value: observation } = await withApp(spec, ctx => execute({ steps: example.steps }, plan, ctx), { attach: true })
+  const { attached, value: observation } = await withApp(
+    spec,
+    ctx => execute({ steps: example.steps }, plan, ctx),
+    { attach: true, specPath: path, command: 'replay' })
 
   const violation = observation.error ? null : firstViolation(invariants, observation)
   const reproduced = Boolean(violation)
