@@ -63,6 +63,9 @@ jobs:
     # never run would be the one thing this tool exists not to do.
     runs-on: windows-latest
     continue-on-error: true
+    # The suite finishes in minutes when it finishes at all. Without a bound, one hung test
+    # holds the run open for GitHub's six-hour default.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with: {fetch-depth: 0}
