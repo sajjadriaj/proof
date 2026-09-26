@@ -1652,10 +1652,23 @@ export const STATUS_TAG = { passed: 'PASS', failed: 'FAIL', skipped: 'SKIP' }
 
 // Colour only for a person at a terminal: a pipe, a log file or NO_COLOR gets the plain text,
 // and so does every test that captures console.log.
-const paint = code => text => process.stdout.isTTY && !process.env.NO_COLOR ? `\x1b[${code}m${text}\x1b[0m` : text
+const tty = () => process.stdout.isTTY && !process.env.NO_COLOR
+const paint = code => text => tty() ? `\x1b[${code}m${text}\x1b[0m` : text
 const bold = paint('1'), dim = paint('2')
 const TAG_COLOR = { passed: paint('32'), failed: paint('31'), skipped: paint('33') }
 const VERDICT_COLOR = { passed: paint('1;32'), failed: paint('1;31') }
+
+/**
+ * The tally as a bar, one colour per status. Any nonzero count keeps at least one cell: one
+ * failure among five hundred checks is the thing the bar exists to show.
+ */
+export function tallyBar(counts, width = 30) {
+  const total = counts.reduce((n, c) => n + c.n, 0)
+  if (!total) return ''
+  const cells = counts.map(c => c.n ? Math.max(1, Math.round(c.n / total * width)) : 0)
+  cells[cells.indexOf(Math.max(...cells))] += width - cells.reduce((a, b) => a + b, 0)
+  return counts.map((c, i) => cells[i] ? c.paint('█'.repeat(cells[i])) : '').join('')
+}
 
 function printHuman(r) {
   const names = r.results.map(x => truncateToWidth(x.name, NAME_COLUMN_MAX))
@@ -1726,5 +1739,9 @@ function printHuman(r) {
   const covered = r.criteria?.length
     ? `, ${r.criteria.filter(c => c.status === 'verified').length}/${r.criteria.length} criteria verified`
     : ''
-  console.log(`\n${bold('VERDICT')}\n  ${(VERDICT_COLOR[r.status] ?? paint('1;33'))(verdictLine(r))}\n  ${tally}${covered}\n`)
+  // The bar is decoration for a person at a terminal; logs and pipes keep the plain tally line.
+  const bar = tty()
+    ? tallyBar(['passed', 'failed', 'skipped'].map(s => ({ n: count(s), paint: TAG_COLOR[s] }))) + '  '
+    : ''
+  console.log(`\n${bold('VERDICT')}\n  ${(VERDICT_COLOR[r.status] ?? paint('1;33'))(verdictLine(r))}\n  ${bar}${tally}${covered}\n`)
 }
