@@ -1650,15 +1650,22 @@ export const verdictLine = r => (r.status === 'partial' && r.partial
 /** The tag in the CHECKS column. A skip is neither of the two things a verdict is made of. */
 export const STATUS_TAG = { passed: 'PASS', failed: 'FAIL', skipped: 'SKIP' }
 
+// Colour only for a person at a terminal: a pipe, a log file or NO_COLOR gets the plain text,
+// and so does every test that captures console.log.
+const paint = code => text => process.stdout.isTTY && !process.env.NO_COLOR ? `\x1b[${code}m${text}\x1b[0m` : text
+const bold = paint('1'), dim = paint('2')
+const TAG_COLOR = { passed: paint('32'), failed: paint('31'), skipped: paint('33') }
+const VERDICT_COLOR = { passed: paint('1;32'), failed: paint('1;31') }
+
 function printHuman(r) {
   const names = r.results.map(x => truncateToWidth(x.name, NAME_COLUMN_MAX))
   const w = columnWidth(r.results.map(x => x.name), NAME_COLUMN_MAX)
-  console.log('\nPROOF')
-  if (r.goal) console.log(`\nRequirement:\n${block(r.goal, '  ')}`)
-  console.log('\nCHECKS')
-  r.results.forEach((c, i) => console.log(`  ${padTo(names[i], w + 2)}${STATUS_TAG[c.status] ?? 'FAIL'}`))
+  console.log(`\n${bold('PROOF')}`)
+  if (r.goal) console.log(`\n${bold('Requirement:')}\n${block(r.goal, '  ')}`)
+  console.log(`\n${bold('CHECKS')}`)
+  r.results.forEach((c, i) => console.log(`  ${padTo(names[i], w + 2)}${(TAG_COLOR[c.status] ?? TAG_COLOR.failed)(STATUS_TAG[c.status] ?? 'FAIL')}`))
   for (const f of r.failures) {
-    console.log(`\nFAILURE\n  Check:\n    ${f.check}`)
+    console.log(`\n${bold(paint('31')('FAILURE'))}\n  Check:\n    ${f.check}`)
     // The one fact that separates "this change broke it" from "this change did not fix it".
     // Both render identically otherwise, and only the first is about the edit just made.
     if (f.was === 'passed') console.log(`  Regression:\n    passed in run ${f.since}, fails now`)
@@ -1704,7 +1711,7 @@ function printHuman(r) {
   // One NOTE section, not two with an Evidence block between them wearing the same heading.
   const notes = [r.advisory, evidenceGrowth(RUNS())].filter(Boolean)
   if (notes.length) console.log(`\nNOTE\n${notes.map(indent).join('\n\n')}`)
-  console.log(`\nEvidence:\n  ${join(r.run, 'result.json')}\n  ${join(r.run, 'commands.log')}`)
+  console.log(`\n${bold('Evidence:')}\n  ${dim(join(r.run, 'result.json'))}\n  ${dim(join(r.run, 'commands.log'))}`)
   // A tally, because at any size past a handful nobody counts the rows — and past a
   // screenful the list has scrolled away by the time the verdict appears.
   const count = status => r.results.filter(c => c.status === status).length
@@ -1719,5 +1726,5 @@ function printHuman(r) {
   const covered = r.criteria?.length
     ? `, ${r.criteria.filter(c => c.status === 'verified').length}/${r.criteria.length} criteria verified`
     : ''
-  console.log(`\nVERDICT\n  ${verdictLine(r)}\n  ${tally}${covered}\n`)
+  console.log(`\n${bold('VERDICT')}\n  ${(VERDICT_COLOR[r.status] ?? paint('1;33'))(verdictLine(r))}\n  ${tally}${covered}\n`)
 }

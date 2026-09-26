@@ -1,0 +1,24 @@
+goal: users can log in and see their profile
+
+serve:
+  run: node server.mjs
+  ready_url: http://localhost:3000
+
+checks:
+  - name: login sets a session
+    http:
+      method: POST
+      path: /login
+      body: {email: ada@example.com}
+      expect: {status: 200, headers: {set-cookie: HttpOnly}}
+
+  - name: profile shows the user
+    http:
+      path: /profile
+      headers: {cookie: sid=s3cr3t}
+      expect: {status: 200, body_contains: ada}
+
+  - name: errors never leak internals
+    http:
+      path: /auth
+      expect: {status: 500, body_not_contains: stack}
