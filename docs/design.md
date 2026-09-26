@@ -2,7 +2,9 @@
 
 [← back to README](../README.md)
 
-## Design
+Why `proof` works the way it does, what it will not do, and how to work on it.
+
+## Principles
 
 **Evidence over confidence.** `proof` reports what it observed. It never asks a model
 whether something looks correct.

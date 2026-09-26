@@ -2,6 +2,8 @@
 
 [← back to README](../README.md)
 
+What each verdict means, what a green run does *not* prove, and what `proof` records for every run.
+
 ## Five verdicts, not two
 
 | Verdict | Where | Means |
@@ -25,6 +27,30 @@ An attack has five of its own, because "we looked and found nothing" is not "it 
 `PASS` is not `DONE`, and `DONE` from `proof check` is a claim about the contract, not about
 the requirement. The claim about the requirement is `proof done`, which is derived from the
 records below rather than from any single run.
+
+## In short: what `proof` refuses to overstate
+
+The point of a verification tool is that its green is trustworthy, so `proof` is explicit about
+what a pass does *not* prove:
+
+```
+NOTE
+  No http or browser check here asserts what the app actually returned, only that it
+  answered — a 200 carrying the wrong body passes. Add `expect: {body_contains: ...}` or
+  `expect: {json: ...}` to the checks that carry the requirement.
+```
+
+- **Strict validation.** An unrecognised key is rejected, never ignored — a silently dropped key
+  is an assertion that never runs.
+- **Regression vs. unfinished.** A failure says whether it passed in the previous run, compared
+  against what that run actually *asserted*, so editing a check never reads as breaking code.
+- **Never DONE for what it did not verify.** A subset run, a scaffolded placeholder, a
+  quarantined `skip:`, an uncovered criterion, a contract edited after sealing — each reports
+  `INCOMPLETE` rather than passing quietly.
+- **Flakes are named, on green runs too.** Every run reads the last ten of the same contract; a
+  check whose history holds both outcomes for the same assertion is called out.
+- **Observed but not gated.** Followed redirects, console errors, a tree that changed mid-run, a
+  contract the same diff rewrote — all reported, none of them silently.
 
 ## What a green run does and does not mean
 

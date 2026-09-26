@@ -2,6 +2,32 @@
 
 [← back to README](../README.md)
 
+Every command in depth: what it prints, its flags, its exit codes, and every field of its `--json` output. Start with the table; jump to a section from the list below it.
+
+**On this page**
+
+- [Commands](#commands)
+  - [What a contract would prove](#what-a-contract-would-prove)
+  - [Reading another runner's results](#reading-another-runners-results)
+  - [Does the contract actually test the change?](#does-the-contract-actually-test-the-change)
+  - [Requirement coverage](#requirement-coverage)
+  - [Sealing the contract, and seeing it move](#sealing-the-contract-and-seeing-it-move)
+  - [Challenging the contract](#challenging-the-contract)
+  - [Counterexamples, and promoting one](#counterexamples-and-promoting-one)
+  - [Attacking a claim](#attacking-a-claim)
+  - [Replaying a counterexample](#replaying-a-counterexample)
+  - [The completion gate](#the-completion-gate)
+  - [Verifying something already running](#verifying-something-already-running)
+  - [Reporting into CI](#reporting-into-ci)
+  - [Running one criterion's evidence](#running-one-criterions-evidence)
+  - [Iterating on one failure](#iterating-on-one-failure)
+  - [When a command fails before it runs](#when-a-command-fails-before-it-runs)
+  - [Every field of `proof check --json`](#every-field-of-proof-check---json)
+  - [Every field of `proof report --json`](#every-field-of-proof-report---json)
+  - [Every field of `proof report --list --json`](#every-field-of-proof-report---list---json)
+  - [Every field of `proof changed --json`](#every-field-of-proof-changed---json)
+  - [Every field of `proof infer --json`](#every-field-of-proof-infer---json)
+
 ## Commands
 
 | Command | What it does |

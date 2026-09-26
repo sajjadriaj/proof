@@ -2,6 +2,8 @@
 
 [← back to README](../README.md)
 
+Start here. How to turn a requirement into a short list of checks that fail without the change.
+
 [`docs/contract.md`](contract.md) is the reference: every verb, every key, every rule.
 This page is the other half — how to decide *what to put in the file*.
 

@@ -2,7 +2,40 @@
 
 [← back to README](../README.md)
 
-## The contract
+Everything `.proof/spec.yaml` can say: each verb and key, the `serve` block, criteria, attacks and challenges. For *what* to put in it, read [Writing a contract](writing-a-contract.md) first.
+
+**On this page**
+
+- [Overview](#overview)
+  - [Criteria — what the checks are evidence for](#criteria--what-the-checks-are-evidence-for)
+  - [Attack — what may be manipulated, and what must stay true](#attack--what-may-be-manipulated-and-what-must-stay-true)
+  - [Challenges — the faults the contract has to catch](#challenges--the-faults-the-contract-has-to-catch)
+  - [Policy — how much evidence `done` requires](#policy--how-much-evidence-done-requires)
+  - [Verbs](#verbs)
+  - [What `env` actually checks](#what-env-actually-checks)
+  - [Sessions](#sessions)
+  - [Redirects](#redirects)
+  - [Request bodies](#request-bodies)
+  - [Letting another runner report for itself](#letting-another-runner-report-for-itself)
+  - [Response headers](#response-headers)
+  - [Races](#races)
+  - [Waiting for work the app does after it answers](#waiting-for-work-the-app-does-after-it-answers)
+  - [Response shape](#response-shape)
+  - [Values one check produces and a later one uses](#values-one-check-produces-and-a-later-one-uses)
+  - [Running independent checks together](#running-independent-checks-together)
+  - [Asserting how long it took](#asserting-how-long-it-took)
+  - [Switching a check off without deleting it](#switching-a-check-off-without-deleting-it)
+  - [How much of a response proof will read](#how-much-of-a-response-proof-will-read)
+  - [Runtime health](#runtime-health)
+  - [More than one process](#more-than-one-process)
+  - [Apps with no HTTP surface](#apps-with-no-http-surface)
+- [Editor support](#editor-support)
+- [The contract is validated strictly](#the-contract-is-validated-strictly)
+  - [Check names must be unique](#check-names-must-be-unique)
+  - [URLs are checked before anything runs](#urls-are-checked-before-anything-runs)
+  - [No guessed host](#no-guessed-host)
+
+## Overview
 
 `.proof/spec.yaml` is a plain, hand-editable file. It is the definition of "done",
 and it is meant to be reviewed and committed like any other source file.
@@ -820,6 +853,17 @@ OBSERVED BUT NOT GATED
 
 The report lists the errors themselves, with source locations, under **Observed but not
 gated** — a reviewer deciding whether a green run is good enough needs the text, not a count.
+
+## Editor support
+
+`.proof/spec.yaml` has a JSON Schema, generated from the same table the validator enforces:
+
+```yaml
+# yaml-language-server: $schema=https://raw.githubusercontent.com/sajjadriaj/proof/main/schema/spec.schema.json
+```
+
+It gives completion and catches unknown keys as you type. `proof check` remains what decides
+whether a contract is valid — the schema cannot express rules like "exactly one verb per check".
 
 ## The contract is validated strictly
 

@@ -2,6 +2,8 @@
 
 [← back to README](../README.md)
 
+Complete contracts for common shapes of work. Copy the closest one and adapt it.
+
 Most verification examples in the wild are web UI flows. These are the other shapes —
 each one is a complete contract you can adapt, and each walks through *why* the checks are
 the ones that catch an agent's false "done".

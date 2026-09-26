@@ -2,6 +2,8 @@
 
 [← back to README](../README.md)
 
+Two commands for when you are not sure what to check: `proof changed` (what the diff touches) and `proof infer` (what it leaves unverified).
+
 ## Blast radius
 
 `proof changed --depth 2` walks the reverse import graph outward from the diff, then

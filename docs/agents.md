@@ -2,6 +2,8 @@
 
 [← back to README](../README.md)
 
+Read this when you want the agent itself to run `proof` — Claude Code's hook, `proof guard`, or a loop around any CLI agent.
+
 ## The agent loop
 
 ```
